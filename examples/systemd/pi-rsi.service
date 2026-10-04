@@ -1,0 +1,15 @@
+[Unit]
+Description=Pi RSI Meta Harness
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/ABSOLUTE/PATH/pi-rsi-meta-harness
+ExecStart=/usr/bin/python3 controller.py --config research.toml run
+Restart=on-failure
+RestartSec=10
+# Recommended: run as a dedicated unprivileged user.
+User=research
+
+[Install]
+WantedBy=default.target

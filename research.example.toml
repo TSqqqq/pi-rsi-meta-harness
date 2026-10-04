@@ -1,0 +1,111 @@
+# Copy to research.toml and edit for the target repository.
+
+[pi]
+binary = "pi"
+
+[project]
+name = "example-paper"
+repo = "/absolute/path/to/example-paper"
+# Where harness-owned state lives. Relative paths resolve from this harness repo.
+state_dir = "./state"
+worktree_dir = "./worktrees"
+artifact_dir = "./artifacts"
+session_dir = "./sessions"
+log_dir = "./logs"
+
+[objective]
+metric = "accuracy"
+direction = "maximize"          # maximize | minimize
+target = 78.5
+min_meaningful_delta = 0.10
+# Metric is read from the last JSON object printed by commands.evaluate.
+metric_json_key = "metric"
+
+[commands]
+# Templates receive: {repo}, {worktree}, {experiment_id}, {stage}, {seed}, {gpu_ids}
+# Full-fidelity baseline. Optional baseline_quick/baseline_medium override the stage commands for baseline calibration.
+baseline = "{python} train.py --config configs/baseline.yaml --seed {seed}"
+baseline_quick = "{python} train.py --config configs/baseline.yaml --steps 1000 --seed {seed}"
+baseline_medium = "{python} train.py --config configs/baseline.yaml --steps 5000 --seed {seed}"
+quick = "{python} train.py --config {worktree}/research_config.yaml --steps 1000 --seed {seed}"
+medium = "{python} train.py --config {worktree}/research_config.yaml --steps 5000 --seed {seed}"
+full = "{python} train.py --config {worktree}/research_config.yaml --seed {seed}"
+evaluate = "{python} evaluate.py --checkpoint outputs/{experiment_id}/{stage}/{seed}"
+# Optional lightweight command run after the worker edits code and before expensive training.
+preflight = "{python} -m compileall -q ."
+
+[stages]
+quick_min_delta = -0.05
+medium_min_delta = 0.05
+validation_seeds = [1, 2, 3]
+quick_timeout_min = 30
+medium_timeout_min = 180
+full_timeout_min = 1440
+
+[resources]
+gpus = [0,1,2,3,4,5,6,7]
+gpus_per_trial = 1
+max_parallel = 8
+poll_seconds = 2
+
+[search]
+batch_size = 8
+scouts = 3
+meta_review_every = 25
+frontier_size = 12
+# Relative weights. They need not sum to 1.
+champion_weight = 25
+promising_weight = 20
+near_miss_weight = 15
+novel_weight = 15
+uncertain_weight = 10
+crossover_weight = 15
+
+[models]
+# single: use one model. dual: route insight-heavy work to planner and mechanical work to worker.
+mode = "single"
+# Empty means: keep Pi's currently selected/default model.
+default = ""
+planner = ""
+worker = ""
+planner_thinking = "high"
+worker_thinking = "minimal"
+allow_escalation = true
+max_worker_failures_before_escalation = 2
+# Meta-RSI can suggest routing-policy changes, but cannot add providers/API keys.
+allow_policy_optimization = true
+
+[sessions]
+compact_at_percent = 82
+
+[budget]
+max_gpu_hours = 1000
+max_wall_hours = 168
+max_agent_tokens = 50000000
+max_experiments = 1000
+max_consecutive_crashes = 8
+
+[stop]
+plateau_experiments = 30
+pause_on_plateau = true
+require_full_stage_for_target = true
+
+[files]
+# Patterns are checked against git diffs. Keep evaluator/test split immutable.
+mutable = ["model/**", "models/**", "train/**", "configs/**", "research_config.yaml"]
+immutable = ["evaluate.py", "evaluation/**", "test/**", "tests/final/**", "data/splits/**"]
+
+[dependencies]
+allow_dynamic_pip = true
+# Agents can install these only into the configured project venv.
+allowed_packages = ["optuna", "ray", "sqlalchemy"]
+require_human_for_unlisted = true
+venv_root = "./state/venvs"
+inherit_system_site_packages = true
+
+[dashboard]
+# Keep localhost unless you deliberately put the console behind your own authenticated reverse proxy.
+host = "127.0.0.1"
+port = 8765
+allow_control = true
+refresh_seconds = 2

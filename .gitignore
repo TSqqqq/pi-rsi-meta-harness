@@ -1,0 +1,10 @@
+research.toml
+state/
+worktrees/
+artifacts/
+sessions/
+logs/
+__pycache__/
+*.pyc
+.venv/
+.test-sessions/
