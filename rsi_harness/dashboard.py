@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-import time
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -52,12 +52,16 @@ class DashboardServer:
             "SELECT COALESCE(SUM(total_tokens),0) AS tokens, COALESCE(SUM(cost),0) AS cost FROM agent_runs"
         ) or {}
         active_agents = self.db.query(
-            "SELECT id,ts_start,agent_name,task_type,session_id,provider,model_id,thinking "
+            "SELECT id,ts_start,agent_name,task_type,session_id,provider,model_id,thinking,experiment_id "
             "FROM agent_runs WHERE ts_end IS NULL ORDER BY ts_start"
+        )
+        agent_runs = self.db.query(
+            "SELECT id,ts_start,ts_end,agent_name,task_type,experiment_id,provider,model_id,total_tokens,tool_calls,success "
+            "FROM agent_runs ORDER BY id DESC LIMIT 200"
         )
         active_experiments = self.db.query(
             "SELECT id,title,stage,status,updated_at,metric,delta_parent FROM experiments "
-            "WHERE status IN ('running','implemented','planned') ORDER BY updated_at DESC"
+            "WHERE status IN ('running','implemented','planned','repairing') ORDER BY updated_at DESC"
         )
         model_usage = self.db.query(
             "SELECT provider,model_id,COUNT(*) AS runs,COALESCE(SUM(total_tokens),0) AS tokens,"
@@ -94,6 +98,7 @@ class DashboardServer:
             "agent_tokens": toks.get("tokens", 0),
             "agent_cost": toks.get("cost", 0),
             "active_agents": active_agents,
+            "agent_runs": agent_runs,
             "active_experiments": active_experiments,
             "model_usage": model_usage,
             "status_counts": status_counts,
@@ -132,9 +137,9 @@ class DashboardServer:
             "WHERE experiment_id=? ORDER BY id", (eid,)
         )
         agent_runs = self.db.query(
-            "SELECT id,ts_start,ts_end,agent_name,task_type,provider,model_id,thinking,total_tokens,cost,success,error "
-            "FROM agent_runs WHERE session_id=? OR agent_name=? ORDER BY ts_start",
-            (f"rsi-{eid}", f"worker-{eid}"),
+            "SELECT id,ts_start,ts_end,agent_name,task_type,provider,model_id,thinking,total_tokens,tool_calls,cost,success,error "
+            "FROM agent_runs WHERE experiment_id=? OR session_id=? OR agent_name=? ORDER BY ts_start",
+            (eid, f"rsi-{eid}", f"worker-{eid}"),
         )
         art_dir = self.cfg.artifact_dir / eid
         artifacts = []
@@ -169,6 +174,24 @@ class DashboardServer:
             "patch_preview": patch_preview,
             "worker_summary": worker_summary,
         }
+
+    def agent_transcript(self, run_id: int) -> dict:
+        """Full conversation of one Pi call: every message, tool call/result and harness abort, in order."""
+        run = self.db.one("SELECT * FROM agent_runs WHERE id=?", (run_id,))
+        if not run:
+            raise KeyError(run_id)
+        path = Path(run.get("transcript_path") or "")
+        records = []
+        if path.is_file():
+            with path.open(encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if rec.get("run_id") == run_id:
+                        records.append(rec)
+        return {"run": run, "records": records, "transcript_path": str(path), "available": path.is_file()}
 
     def experiment_log(self, eid: str, lines: int = 240) -> dict:
         lines = min(max(int(lines), 20), 1000)
@@ -249,7 +272,7 @@ class DashboardServer:
                 text = str(data.get("text", "")).strip()
                 if not text:
                     return HTTPStatus.BAD_REQUEST, {"ok": False, "error": "empty idea"}
-                eid = str(data.get("experiment_id", "")).strip() or None
+                eid = str(data.get("experiment_id") or "").strip() or None  # JSON null must not become the string "None"
                 if eid and not self.db.experiment(eid):
                     return HTTPStatus.NOT_FOUND, {"ok": False, "error": "unknown experiment"}
                 iid = self.db.add_idea(text, experiment_id=eid)
@@ -343,6 +366,12 @@ class DashboardServer:
                     except KeyError:
                         self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "unknown experiment"})
                     return
+                if path == "/api/transcript":
+                    try:
+                        self._send_json(HTTPStatus.OK, parent.agent_transcript(int((qs.get("run_id") or ["0"])[0])))
+                    except (KeyError, ValueError):
+                        self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "unknown agent run"})
+                    return
                 if path == "/api/log":
                     eid = (qs.get("experiment_id") or [""])[0]
                     try:
@@ -375,7 +404,7 @@ class DashboardServer:
                 status, out = parent._handle_post(parsed.path, data)
                 self._send_json(status, out)
 
-            def log_message(self, fmt, *args):
+            def log_message(self, format: str, *args: object) -> None:
                 return
 
         self.server = ThreadingHTTPServer((host, port), Handler)

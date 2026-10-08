@@ -180,6 +180,14 @@ CREATE INDEX IF NOT EXISTS idx_metrics_exp ON metrics(experiment_id);
 '''
 
 
+AGENT_RUN_COLUMNS = {
+    "tool_calls": "INTEGER DEFAULT 0",
+    "experiment_id": "TEXT",
+    "transcript_path": "TEXT",
+    "session_file": "TEXT",
+}
+
+
 class ResearchDB:
     def __init__(self, path: Path):
         self.path = path
@@ -201,6 +209,11 @@ class ResearchDB:
         c = sqlite3.connect(self.path)
         try:
             c.executescript(SCHEMA)
+            # Additive migration for databases created before transcript/tool accounting existed.
+            have = {r[1] for r in c.execute("PRAGMA table_info(agent_runs)")}
+            for col, decl in AGENT_RUN_COLUMNS.items():
+                if col not in have:
+                    c.execute(f"ALTER TABLE agent_runs ADD COLUMN {col} {decl}")
             c.commit()
         finally:
             c.close()
@@ -278,8 +291,13 @@ class ResearchDB:
             if key in changes:
                 new_key = key + "_json" if key in {"changes", "metadata"} else key
                 changes[new_key] = json_dumps(changes.pop(key))
+        # Column names cannot be bound parameters; restrict them to the real schema.
+        allowed = {r["name"] for r in self.query("PRAGMA table_info(experiments)")}
+        unknown = set(changes) - allowed
+        if unknown:
+            raise ValueError(f"unknown experiment columns: {sorted(unknown)}")
         cols = ",".join(f"{k}=?" for k in changes)
-        self.execute(f"UPDATE experiments SET {cols} WHERE id=?", [*changes.values(), eid])
+        self.execute(f"UPDATE experiments SET {cols} WHERE id=?", [*changes.values(), eid])  # noqa: S608
 
     def add_metric(self, eid: str, stage: str, seed: int | None, metric: float, extra: dict[str, Any] | None = None) -> None:
         self.execute(
@@ -311,12 +329,13 @@ class ResearchDB:
         return None if not row or row.get("x") is None else float(row["x"])
 
     def best(self, direction: str) -> dict[str, Any] | None:
-        order = "DESC" if direction == "maximize" else "ASC"
+        order = "DESC" if direction == "maximize" else "ASC"  # fixed literal, never user input
         # Champion comparisons use only publication-comparable full/validated results.
-        return self.one(
-            f"SELECT * FROM experiments WHERE metric IS NOT NULL AND validated=1 AND stage='full' "
-            f"AND status NOT IN ('invalid','failed') ORDER BY metric {order} LIMIT 1"
+        sql = (
+            "SELECT * FROM experiments WHERE metric IS NOT NULL AND validated=1 AND stage='full' "
+            "AND status NOT IN ('invalid','failed') ORDER BY metric " + order + " LIMIT 1"
         )
+        return self.one(sql)
 
     def add_guidance(self, text: str, kind: str = "note", experiment_id: str | None = None) -> None:
         self.execute("INSERT INTO human_guidance(ts,experiment_id,kind,text) VALUES(?,?,?,?)", (time.time(), experiment_id, kind, text))

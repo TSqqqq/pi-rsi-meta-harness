@@ -2,27 +2,33 @@
 
 [pi]
 binary = "pi"
+# Every agent runs in bwrap: read-only host, writable own worktree only. Fails closed if bwrap is missing.
+sandbox = true
+# Global Pi extensions off for headless agents (interactive confirm dialogs block RPC; extra tools widen reach).
+extensions = false
 
 [project]
 name = "example-paper"
 repo = "/absolute/path/to/example-paper"
-# Where harness-owned state lives. Relative paths resolve from this harness repo.
-state_dir = "./state"
-worktree_dir = "./worktrees"
-artifact_dir = "./artifacts"
-session_dir = "./sessions"
-log_dir = "./logs"
+# One directory per campaign. worktrees/artifacts/sessions/transcripts/logs default to <state_dir>/<name>,
+# so a new campaign never shares agents, worktrees or history with an old one.
+state_dir = "./state/campaign-1"
+# Paper-specific context injected into scout/worker prompts (both optional, see docs/ADAPTER.md).
+codebase_map = "./prompts/codebase.example.md"
+idea_file = ""
 
 [objective]
 metric = "accuracy"
 direction = "maximize"          # maximize | minimize
 target = 78.5
+# Set from measured noise: run the baseline twice with the same config; deltas below this are "unproven".
 min_meaningful_delta = 0.10
 # Metric is read from the last JSON object printed by commands.evaluate.
 metric_json_key = "metric"
 
 [commands]
-# Templates receive: {repo}, {worktree}, {experiment_id}, {stage}, {seed}, {gpu_ids}
+# Templates receive: {repo}, {worktree}, {experiment_id}, {stage}, {seed}, {gpu_ids}, {python},
+# plus every key of [experiment]. Commands run outside the sandbox on CUDA_VISIBLE_DEVICES={gpu_ids}.
 # Full-fidelity baseline. Optional baseline_quick/baseline_medium override the stage commands for baseline calibration.
 baseline = "{python} train.py --config configs/baseline.yaml --seed {seed}"
 baseline_quick = "{python} train.py --config configs/baseline.yaml --steps 1000 --seed {seed}"
@@ -34,10 +40,15 @@ evaluate = "{python} evaluate.py --checkpoint outputs/{experiment_id}/{stage}/{s
 # Optional lightweight command run after the worker edits code and before expensive training.
 preflight = "{python} -m compileall -q ."
 
+[experiment]
+# Paper-specific knobs, available as {name} in command templates. Example:
+# lr = 3e-4
+
 [stages]
 quick_min_delta = -0.05
 medium_min_delta = 0.05
 validation_seeds = [1, 2, 3]
+# ~3-4x the normal duration: caps hung runs (e.g. a stalled model download) without killing slow variants.
 quick_timeout_min = 30
 medium_timeout_min = 180
 full_timeout_min = 1440
@@ -65,6 +76,9 @@ crossover_weight = 15
 # single: use one model. dual: route insight-heavy work to planner and mechanical work to worker.
 mode = "single"
 # Empty means: keep Pi's currently selected/default model.
+# Cost guard: prompts to providers outside this list are refused before they are sent.
+# Develop with a local model (e.g. ["local-vllm"]), then add a paid provider deliberately.
+allowed_providers = ["local-vllm"]
 default = ""
 planner = ""
 worker = ""
@@ -85,7 +99,19 @@ max_agent_tokens = 50000000
 max_experiments = 1000
 max_consecutive_crashes = 8
 
+[agents]
+# Hard per-task budgets for every Pi agent. Exceeding either aborts the run (no repair loop for aborts).
+max_tool_calls = 40
+worker_timeout_min = 10
+repair_timeout_min = 10
+
+[repair]
+# Bounded self-repair of a failed patch before the experiment is recorded as failed.
+max_attempts = 2
+
 [stop]
+# Consecutive worker failures before pausing for a human ("resume" resets the streak).
+max_worker_failures = 3
 plateau_experiments = 30
 pause_on_plateau = true
 require_full_stage_for_target = true

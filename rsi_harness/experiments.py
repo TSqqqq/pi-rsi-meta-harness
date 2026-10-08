@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import signal
 import statistics
@@ -9,7 +8,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .config import Config
 from .db import ResearchDB
@@ -63,14 +62,14 @@ class ExperimentRunner:
             assert proc.stdout
             with log_path.open("a", encoding="utf-8") as f:
                 while True:
-                    line = await proc.stdout.readline()
-                    if not line:
+                    chunk = await proc.stdout.read(65536)
+                    if not chunk:
                         break
-                    text = line.decode("utf-8", "replace")
+                    text = chunk.decode("utf-8", "replace")
                     output.append(text)
                     f.write(text)
                     f.flush()
-                    print(f"[{source}] {text}", end="", flush=True)
+                    print(text, end="", flush=True)
 
         consumer = asyncio.create_task(consume())
         try:
@@ -121,6 +120,8 @@ class ExperimentRunner:
         vpy = venv_root / eid / "bin" / "python"
         python_bin = str(vpy) if vpy.exists() else sys.executable
         return {
+            # Paper-specific knobs: every key of [experiment] becomes a {placeholder}; built-ins below win on clashes.
+            **self.cfg.section("experiment"),
             "repo": self.cfg.repo,
             "worktree": worktree,
             "experiment_id": eid,
@@ -134,6 +135,8 @@ class ExperimentRunner:
         template = str(self.cfg.get("commands", "preflight", "") or "")
         if not template:
             return
+        vals = self._values(eid, worktree, "quick", 1, [])
+        template = shell_template(template, **vals)
         log = self.cfg.log_dir / "experiments" / f"{eid}.preflight.log"
         env = os.environ.copy()
         rc, out, _ = await self._run_command(template, cwd=worktree, env=env, log_path=log, source=f"{eid}:PREFLIGHT", timeout_s=600)

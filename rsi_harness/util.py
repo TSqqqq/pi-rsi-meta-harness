@@ -3,12 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import shlex
 import subprocess
 import time
-from dataclasses import dataclass
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 
 def now_ts() -> float:
@@ -30,7 +29,7 @@ def resolve(base: Path, value: str | Path) -> Path:
 
 
 def run_capture(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)
+    return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, check=check)
 
 
 def split_model(spec: str) -> tuple[str, str]:
@@ -54,17 +53,51 @@ def parse_last_json_object(text: str) -> dict[str, Any]:
     raise ValueError("No JSON object found in command output")
 
 
-def parse_json_from_agent_text(text: str) -> Any:
-    """Accept strict JSON or one fenced JSON block; avoid fragile broad extraction."""
-    t = text.strip()
-    try:
-        return json.loads(t)
-    except json.JSONDecodeError:
-        pass
-    m = re.search(r"```(?:json)?\s*(.*?)\s*```", t, re.S | re.I)
-    if m:
-        return json.loads(m.group(1))
-    raise ValueError("Agent response was not valid JSON")
+def _json_candidates(text: str) -> list[str]:
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I).strip()
+    blocks = re.findall(r"```(?:json)?\s*(.*?)\s*```", cleaned, re.S | re.I)
+    sources = blocks + [cleaned]
+    starts = [m.start() for m in re.finditer(r"\{", cleaned)]
+    for start in starts:
+        depth = 0
+        quoted = False
+        escaped = False
+        for i in range(start, len(cleaned)):
+            ch = cleaned[i]
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    quoted = False
+                continue
+            if ch == '"':
+                quoted = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    sources.append(cleaned[start:i + 1])
+                    break
+    return sources
+
+
+def parse_json_from_agent_text(text: str, required_key: str | None = None) -> Any:
+    """Parse strict, fenced, think-wrapped, or lightly malformed JSON from an agent."""
+    errors: list[str] = []
+    for source in _json_candidates(text):
+        candidate = re.sub(r",\s*([}\]])", r"\1", source.strip())
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            errors.append(str(exc))
+            continue
+        if required_key is None or (isinstance(obj, dict) and required_key in obj):
+            return obj
+    suffix = f" containing {required_key!r}" if required_key else ""
+    raise ValueError(f"Agent response was not valid JSON{suffix}: {errors[-1] if errors else 'no object found'}")
 
 
 def shell_template(template: str, **values: Any) -> str:

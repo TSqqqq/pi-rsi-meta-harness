@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, sys
+import json, os, sys
 last = ""
 model = {"provider":"fake","id":"planner","name":"Planner","reasoning":True,"contextWindow":100000,"maxTokens":10000}
 stats = {"sessionFile":"/tmp/fake.jsonl","sessionId":"fake","tokens":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0},"cost":0,"contextUsage":{"tokens":0,"contextWindow":100000,"percent":0}}
@@ -33,12 +33,31 @@ for raw in sys.stdin.buffer:
             last=json.dumps({"rationale":"toy","policy":{"increase_budget":[],"decrease_budget":[],"revive_nodes":[],"crossovers":[],"new_directions":[],"exploration_ratio":0.3,"model_routing_notes":""}})
         elif "implementation worker" in msg:
             last="implemented toy change"
+            if os.environ.get("FAKE_PI_ESCAPE"):
+                # Simulates an agent that edits the main checkout instead of its worktree.
+                try:
+                    with open(os.environ["FAKE_PI_ESCAPE"], "a") as f:
+                        f.write("# escaped edit\n")
+                except OSError:
+                    last="escape blocked by sandbox"
         else:
             last='{"ok": true}'
         resp(t,{"disposition":"started"})
         print(json.dumps({"type":"agent_start"}),flush=True)
+        if "LOOP_TOOLS" in msg:
+            # Simulates a runaway agent: endless tool calls, never settles until aborted.
+            for i in range(1000):
+                print(json.dumps({"type":"tool_execution_start","toolCallId":f"c{i}","toolName":"bash","args":{"command":"ls"}}),flush=True)
+            continue
+        if "BIG_LINE" in msg:
+            last = "x" * 200_000  # larger than asyncio's 64 KiB default line limit
+        if "HANG" in msg or ("implementation worker" in msg and os.environ.get("FAKE_PI_WORKER_HANG")):
+            continue  # never settles; only abort ends it
         print(json.dumps({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":last}}),flush=True)
+        print(json.dumps({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":last}],"provider":model["provider"],"model":model["id"]}}),flush=True)
         print(json.dumps({"type":"agent_settled"}),flush=True)
-    elif t=="abort": resp(t)
+    elif t=="abort":
+        print(json.dumps({"type":"agent_settled"}),flush=True)
+        resp(t)
     elif t=="compact": resp(t,{"summary":"fake","tokensBefore":100,"estimatedTokensAfter":20})
     else: resp(t,success=False,error="unsupported")

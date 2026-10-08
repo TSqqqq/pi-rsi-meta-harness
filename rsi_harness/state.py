@@ -1,6 +1,10 @@
-from __future__ import annotations
+from enum import Enum
 
-from enum import StrEnum
+try:
+    StrEnum = __import__("enum").StrEnum
+except AttributeError:
+    class StrEnum(str, Enum):
+        pass
 
 
 class HarnessState(StrEnum):
@@ -24,3 +28,7 @@ TERMINAL_STATES = {
     HarnessState.STOPPED_BY_USER,
     HarnessState.FATAL_ERROR,
 }
+
+
+# Experiment statuses that mean "work in flight"; anything else is settled.
+ACTIVE_STATUSES = ("planned", "implemented", "running", "repairing")

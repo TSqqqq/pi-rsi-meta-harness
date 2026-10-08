@@ -10,6 +10,7 @@ from .config import Config
 from .controller import ResearchController
 from .dashboard import DashboardServer
 from .db import ResearchDB
+from .gitops import head_commit, is_dirty
 from .state import HarnessState
 
 
@@ -40,6 +41,31 @@ def cmd_status(cfg: Config, db: ResearchDB) -> int:
     return 0
 
 
+def cmd_rebase_baseline(cfg: Config, db: ResearchDB, ns) -> int:
+    """Move the baseline to HEAD so new worktrees get current harness/adapter code. History is kept, not rewritten."""
+    if is_dirty(cfg.repo):
+        raise SystemExit("commit first: the new baseline must be an exact commit")
+    base = db.experiment("baseline") or {}
+    old_commit, new_commit = base.get("git_commit"), head_commit(cfg.repo)
+    stages = dict(db.get_meta("baseline_stage_metrics", {}) or {})
+    old_metric = stages.get(ns.stage)
+    if old_metric is not None and abs(float(old_metric) - ns.metric) > ns.tolerance:
+        raise SystemExit(f"baseline {ns.stage} changed {old_metric} -> {ns.metric} (> tolerance {ns.tolerance}); not behavior-preserving")
+    # The re-run is one more measurement of the same configuration: keep both, compare against their mean.
+    db.add_metric("baseline", ns.stage, None, ns.metric, {"rebase_commit": new_commit, "evidence": ns.evidence})
+    stages[ns.stage] = db.metric_mean("baseline", ns.stage)
+    db.update_experiment("baseline", git_commit=new_commit)
+    db.set_meta("baseline_commit", new_commit)
+    db.set_meta("baseline_stage_metrics", stages)
+    db.execute(
+        "INSERT INTO events(ts,level,type,source,message,payload_json) VALUES(?,?,?,?,?,?)",
+        (time.time(), "INFO", "baseline_rebased", "HUMAN", f"baseline {old_commit} -> {new_commit}; {ns.stage}={ns.metric}",
+         json.dumps({"old_commit": old_commit, "new_commit": new_commit, "old_metric": old_metric, "evidence": ns.evidence})),
+    )
+    print(f"baseline rebased to {new_commit[:10]}; {ns.stage} mean {old_metric} -> {stages[ns.stage]}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Pi RSI Meta Harness")
     ap.add_argument("--config", default="research.toml", help="research TOML path")
@@ -57,6 +83,10 @@ def main(argv: list[str] | None = None) -> int:
     steer = sub.add_parser("steer"); steer.add_argument("agent_name"); steer.add_argument("text")
     approve = sub.add_parser("approve-dependency"); approve.add_argument("package")
     reject = sub.add_parser("reject-dependency"); reject.add_argument("package"); reject.add_argument("--reason", default="rejected by human")
+    rebase = sub.add_parser("rebase-baseline", help="branch new experiments from the current HEAD after re-measuring the baseline")
+    rebase.add_argument("--stage", default="quick"); rebase.add_argument("--metric", type=float, required=True)
+    rebase.add_argument("--evidence", required=True, help="evaluation result file of the baseline re-run at HEAD")
+    rebase.add_argument("--tolerance", type=float, default=0.01, help="max |old-new| attributed to run-to-run noise")
     ns = ap.parse_args(argv)
     cfg, db, root = load(ns)
 
@@ -93,6 +123,8 @@ def main(argv: list[str] | None = None) -> int:
         note_text = "approved by human" if status == "approved" else ns.reason
         db.execute("UPDATE dependency_requests SET status=?,resolved_at=?,note=? WHERE id=?", (status, time.time(), note_text, row["id"]))
         print(f"{ns.package}: {status}"); return 0
+    if ns.cmd == "rebase-baseline":
+        return cmd_rebase_baseline(cfg, db, ns)
     if ns.cmd == "dashboard":
         srv = DashboardServer(cfg, db, root / "dashboard" / "index.html")
         srv.start()

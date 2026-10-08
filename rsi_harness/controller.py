@@ -1,10 +1,8 @@
-from __future__ import annotations
-
 import asyncio
+import contextlib
+import fcntl
 import json
 import os
-import shutil
-import signal
 import statistics
 import sys
 import time
@@ -19,21 +17,19 @@ from .db import ResearchDB
 from .events import EventBus
 from .experiments import ExperimentRunner
 from .frontier import FrontierSelector
-from .gitops import (
-    GitError,
-    commit_all,
-    create_worktree,
-    ensure_git_repo,
-    head_commit,
-    is_dirty,
-    save_patch,
-    validate_modified_paths,
-)
+from .gitops import (commit_all, create_worktree, ensure_git_repo, head_commit,
+                     is_dirty, save_patch, validate_modified_paths)
 from .integrity import record_immutable_hashes, verify_immutable_hashes
+from .pi_rpc import AgentAborted
 from .scheduler import GPUScheduler
-from .state import HarnessState, TERMINAL_STATES
+from .state import ACTIVE_STATUSES, TERMINAL_STATES, HarnessState
 from .stopping import StopPolicy
-from .util import ensure_dir, parse_json_from_agent_text, parse_last_json_object, shell_template
+from .util import (ensure_dir, parse_json_from_agent_text,
+                   parse_last_json_object, shell_template)
+
+
+class MainRepoModified(RuntimeError):
+    """An agent edited the main checkout instead of its worktree."""
 
 
 class ResearchController:
@@ -51,12 +47,33 @@ class ResearchController:
         self.dashboard = DashboardServer(cfg, self.db, harness_root / "dashboard" / "index.html")
         self._stop_requested = asyncio.Event()
         self._control_task: asyncio.Task[None] | None = None
+        self._iteration: asyncio.Task[bool] | None = None
         self._last_meta_count = int(self.db.get_meta("last_meta_count", 0) or 0)
+        self._worker_failures = 0
 
     def set_state(self, state: HarnessState, reason: str = "") -> None:
         self.db.set_meta("state", state.value)
         self.db.set_meta("pause_reason", reason)
         self.events.emit("state", f"state={state.value}" + (f" reason={reason}" if reason else ""), source="CONTROLLER")
+
+    def _worktree_rule(self, worktree: Path) -> str:
+        return (
+            f"\n\nWORKTREE: {worktree}\nEdit files only under this directory, using paths inside it. "
+            f"Never modify {self.cfg.repo} outside {self.cfg.worktree_dir}: the controller treats that as a "
+            "safety violation and stops the whole campaign.\n"
+        )
+
+    def _agent_timeout(self, kind: str) -> float:
+        return 60.0 * float(self.cfg.get("agents", f"{kind}_timeout_min", 10))
+
+    def _project_file(self, key: str) -> Path | None:
+        raw = self.cfg.get("project", key)
+        return (self.cfg.base_dir / raw).resolve() if raw else None
+
+    def _codebase_map(self) -> str:
+        """Paper-specific map of what agents may change; see docs/ADAPTER.md. Without it small models wander."""
+        path = self._project_file("codebase_map")
+        return "\n\n" + path.read_text(encoding="utf-8") if path and path.is_file() else ""
 
     def _load_prompt(self, name: str) -> str:
         return (self.harness_root / "prompts" / name).read_text(encoding="utf-8")
@@ -117,6 +134,7 @@ class ResearchController:
                         "seed": seed,
                         "gpu_ids": ",".join(map(str, alloc.gpu_ids)),
                         "python": sys.executable,
+                        "device": self.cfg.get("experiment", "device", 0),
                     }
                     timeout = float(self.cfg.get("stages", f"{stage}_timeout_min", self.cfg.get("stages", "full_timeout_min", 1440))) * 60
                     log = self.cfg.log_dir / "experiments" / f"baseline.{stage}.seed{seed}.train.log"
@@ -183,14 +201,48 @@ class ResearchController:
                 if action == "stop":
                     self.set_state(HarnessState.STOPPED_BY_USER, "human stop")
                     self._stop_requested.set()
-                    await self.agents.abort_all()
-                    await self.runner.abort_all()
+                    await self._interrupt("human stop")
                     return
                 if action == "pause":
-                    self.set_state(HarnessState.PAUSED, "human pause; no new work will be scheduled")
+                    self.set_state(HarnessState.PAUSED, "human pause; active agents and experiments interrupted")
+                    await self._interrupt("human pause")
                 if action == "resume":
+                    self._worker_failures = 0  # the human has seen the streak; do not re-pause on the next single failure
                     self.set_state(HarnessState.RUNNING, "human resume")
             await asyncio.sleep(1)
+
+    def _settle_inflight(self, reason: str) -> None:
+        """Close every in-flight row. Called when nothing can still be running: at startup or after an interrupt."""
+        n_runs = self.db.execute(
+            "UPDATE agent_runs SET ts_end=?,success=0,error=COALESCE(error,?) WHERE ts_end IS NULL",
+            (time.time(), reason),
+        ).rowcount
+        marks = ",".join("?" * len(ACTIVE_STATUSES))
+        rows = self.db.query("SELECT id FROM experiments WHERE status IN (" + marks + ")", ACTIVE_STATUSES)
+        for r in rows:
+            self.db.update_experiment(r["id"], status="interrupted", failure_reason=reason)
+        if n_runs or rows:
+            self.events.emit("settled", f"{reason}: {n_runs} agent runs and {len(rows)} experiments marked interrupted", source="CONTROLLER", level="WARN")
+
+    def _guard_main_repo(self, source: str) -> None:
+        """Agents run unsandboxed; any edit to the main checkout corrupts every later worktree and baseline."""
+        if not is_dirty(self.cfg.repo):
+            return
+        dest = ensure_dir(self.cfg.artifact_dir / "escapes") / f"{int(time.time())}_{source}.diff"
+        save_patch(self.cfg.repo, dest)
+        self.set_state(HarnessState.SAFETY_STOP, f"{source} modified the main repository outside its worktree; diff saved to {dest}")
+        raise MainRepoModified(str(dest))
+
+    async def _interrupt(self, reason: str) -> None:
+        """Hard-stop all in-flight work: cancel the iteration, abort every Pi run, kill experiment processes."""
+        task = self._iteration
+        if task and not task.done():
+            task.cancel()
+        await self.agents.abort_all(reason)
+        await self.runner.abort_all()
+        if task:
+            await asyncio.wait({task}, timeout=30)
+        self._settle_inflight(f"interrupted by {reason}")
 
     async def _wait_if_paused(self) -> bool:
         while True:
@@ -214,8 +266,12 @@ class ResearchController:
         frontier = self.frontier.select()
         state = self.context.global_state()
         state["frontier"] = frontier
+        idea_path = self._project_file("idea_file")
+        if idea_path and idea_path.is_file():
+            state["user_research_idea"] = idea_path.read_text(encoding="utf-8")
+            state["user_research_idea_source"] = str(idea_path)
         snapshot = self.context.render(state)
-        scout_prompt = self._load_prompt("scout.md")
+        scout_prompt = self._load_prompt("scout.md") + self._codebase_map()
         nscouts = int(self.cfg.get("search", "scouts", 3))
         tasks = []
         for i, focus in enumerate(self._scout_focuses(nscouts)):
@@ -297,13 +353,17 @@ class ResearchController:
         worktree = create_worktree(self.cfg, eid, parent_commit)
         self.db.update_experiment(eid, worktree=str(worktree))
         context = self.context.render(self.context.node_context(parents), 30000)
-        worker_prompt = self._load_prompt("worker.md") + "\n\nASSIGNED EXPERIMENT:\n" + json.dumps(candidate, ensure_ascii=False, indent=2)
+        worker_prompt = self._load_prompt("worker.md") + self._codebase_map()
+        worker_prompt += self._worktree_rule(worktree)
+        worker_prompt += "\n\nASSIGNED EXPERIMENT:\n" + json.dumps(candidate, ensure_ascii=False, indent=2)
         worker_prompt += "\n\nRELEVANT RESEARCH CONTEXT:\n" + context
         try:
+            # The worker must hand over a runnable patch within this window, or the experiment never starts.
             summary = await self.agents.run_task(
                 agent_name=f"worker-{eid}", role="worker", task_type="implementation", prompt=worker_prompt,
-                cwd=worktree, session_id=f"rsi-{eid}", timeout=3600,
+                cwd=worktree, session_id=f"rsi-{eid}", timeout=self._agent_timeout("worker"), experiment_id=eid,
             )
+            self._guard_main_repo(f"worker-{eid}")
             problems = validate_modified_paths(self.cfg, worktree)
             problems.extend(verify_immutable_hashes(self.cfg, self.db, worktree))
             if problems:
@@ -317,15 +377,79 @@ class ResearchController:
             self.db.update_experiment(eid, git_commit=commit, status="implemented")
             result = await self.runner.run_pipeline(eid, worktree, str(parent["id"]))
             await self.review_experiment(eid, candidate, result)
-        except asyncio.CancelledError:
+            self._worker_failures = 0  # the failure counter is for consecutive failures
+        except (asyncio.CancelledError, MainRepoModified):
             raise
         except Exception as exc:
-            self.db.update_experiment(eid, status="failed", failure_reason=str(exc))
-            self.events.emit("experiment_failed", str(exc), source=eid, level="ERROR")
-            try:
-                await self.review_experiment(eid, candidate, None)
-            except Exception:
-                pass
+            error = f"{type(exc).__name__}: {exc}"
+            # A budget abort means the agent itself is not converging; another agent run would repeat it.
+            repaired = not isinstance(exc, AgentAborted) and await self.repair_candidate(eid, candidate, worktree, error)
+            if repaired:
+                try:
+                    result = await self.runner.run_pipeline(eid, worktree, str(parent["id"]))
+                    await self.review_experiment(eid, candidate, result)
+                    self._worker_failures = 0
+                    return
+                except Exception as repair_exc:
+                    error = f"repair rerun failed: {type(repair_exc).__name__}: {repair_exc}"
+            ran = bool(self.db.query("SELECT 1 FROM metrics WHERE experiment_id=? LIMIT 1", (eid,)))
+            # Without any metric there is no evidence to review; a reviewer would only invent conclusions.
+            lesson = None if ran else f"NOT RUN: no experiment was executed, so the hypothesis is untested. Cause: {error}"
+            self.db.update_experiment(eid, status="failed", failure_reason=error, lesson=lesson)
+            self.events.emit("experiment_failed", error, source=eid, level="ERROR")
+            self._worker_failures += 1
+            if self._worker_failures >= int(self.cfg.get("stop", "max_worker_failures", 3)):
+                self.set_state(HarnessState.PAUSED_FOR_HUMAN, f"{self._worker_failures} consecutive worker failures")
+            if ran:
+                with contextlib.suppress(Exception):
+                    await self.review_experiment(eid, candidate, None)
+
+    async def repair_candidate(self, eid: str, candidate: dict[str, Any], worktree: Path, error: str) -> bool:
+        row = self.db.experiment(eid) or {}
+        try:
+            metadata = json.loads(row.get("metadata_json") or "{}")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"invalid experiment metadata for {eid}") from exc
+        attempt = int(metadata.get("repair_attempts", 0)) + 1
+        max_attempts = int(self.cfg.get("repair", "max_attempts", 2))
+        if attempt > max_attempts:
+            return False
+        metadata["repair_attempts"] = attempt
+        self.db.update_experiment(eid, metadata=metadata, status="repairing", failure_reason=error)
+        prompt = (
+            "You are repairing a failed experiment, not proposing a new idea.\n"
+            "Inspect the existing worktree and the failure below. Make the smallest repair needed.\n"
+            "Do not change evaluator, tests, immutable files, research objective, or create a new hypothesis.\n"
+            "Your job is the experiment code only. If the failure is in the harness itself, do not fix it; explain it and stop.\n"
+            f"{self._worktree_rule(worktree)}\n"
+            f"FAILURE:\n{error}\n\nASSIGNED EXPERIMENT:\n{json.dumps(candidate, ensure_ascii=False, indent=2)}"
+        )
+        try:
+            summary = await self.agents.run_task(
+                agent_name=f"repair-{eid}-{attempt}", role="worker", task_type="repair", prompt=prompt,
+                cwd=worktree, session_id=f"rsi-repair-{eid}-{attempt}", timeout=self._agent_timeout("repair"),
+                experiment_id=eid,
+            )
+            self._guard_main_repo(f"repair-{eid}-{attempt}")
+            problems = validate_modified_paths(self.cfg, worktree)
+            problems.extend(verify_immutable_hashes(self.cfg, self.db, worktree))
+            if problems:
+                raise RuntimeError("repair safety check failed: " + "; ".join(problems))
+            await self.runner.preflight(eid, worktree)
+            artifact = ensure_dir(self.cfg.artifact_dir / eid)
+            (artifact / f"repair_{attempt}_summary.txt").write_text(summary, encoding="utf-8")
+            save_patch(worktree, artifact / f"repair_{attempt}.patch.diff")
+            commit = commit_all(worktree, f"{eid}: repair attempt {attempt}")
+            self.db.update_experiment(eid, git_commit=commit, status="implemented", metadata=metadata)
+            self.events.emit("repair_succeeded", f"repair attempt {attempt} passed preflight", source=eid)
+            return True
+        except (asyncio.CancelledError, MainRepoModified):
+            raise
+        except Exception as exc:
+            message = f"repair attempt {attempt} failed: {type(exc).__name__}: {exc}"
+            self.db.update_experiment(eid, status="failed", failure_reason=message, metadata=metadata)
+            self.events.emit("repair_failed", message, source=eid, level="ERROR")
+            return False
 
     async def review_experiment(self, eid: str, candidate: dict[str, Any], result: Any) -> None:
         exp = self.db.experiment(eid) or {}
@@ -343,6 +467,7 @@ class ResearchController:
             text = await self.agents.run_task(
                 agent_name="reviewer", role="reviewer", task_type="experiment_review",
                 prompt=prompt, cwd=self.cfg.repo, session_id="rsi-reviewer", timeout=1800, force_tier=force_tier,
+                experiment_id=eid,
             )
             obj = parse_json_from_agent_text(text)
             current = self.db.experiment(eid) or {}
@@ -350,6 +475,11 @@ class ResearchController:
             # Do not let a prose reviewer convert an invalid safety failure into success.
             if current.get("status") in {"invalid", "failed"}:
                 status = current["status"]
+            noise = float(self.cfg.get("objective", "min_meaningful_delta", 0.0))
+            delta = current.get("delta_baseline")
+            if status in {"promising", "rejected"} and delta is not None and abs(float(delta)) < noise:
+                # Within run-to-run noise the evidence supports neither verdict.
+                status = "near_miss"
             self.db.update_experiment(
                 eid,
                 status=status,
@@ -447,44 +577,85 @@ class ResearchController:
         except Exception as exc:
             self.events.emit("plateau_analysis_error", str(exc), source="LEAD", level="WARN")
 
+    async def _iterate(self) -> bool:
+        """One research iteration (plan -> batch -> settle). Returns False when the campaign must end."""
+        decision = self.stop_policy.evaluate()
+        if decision.state:
+            if decision.state == HarnessState.PAUSED_FOR_HUMAN:
+                await self.analyze_plateau(decision.reason)
+            self.set_state(decision.state, decision.reason)
+            return decision.state not in TERMINAL_STATES
+        violations = verify_immutable_hashes(self.cfg, self.db)
+        if violations:
+            self.set_state(HarnessState.SAFETY_STOP, "; ".join(violations))
+            return False
+        candidates = await self.generate_candidates()
+        if not candidates:
+            self.set_state(HarnessState.PAUSED_FOR_HUMAN, "agents produced no valid hypotheses; human insight requested")
+            return True
+        batch_started_at = time.time()
+        self.db.set_meta("batch_started_at", batch_started_at)
+        selected = await self.select_candidates(candidates)
+        slots = int(self.cfg.get("resources", "max_parallel", 1))
+        selected = selected[:max(1, slots)]
+        self.events.emit("batch", f"selected {len(selected)} experiments; awaiting full batch settlement", source="CONTROLLER")
+        results = await asyncio.gather(*(self.run_candidate(c) for c in selected), return_exceptions=True)
+        self.refresh_champion()
+        batch_rows = self.db.query(
+            "SELECT * FROM experiments WHERE created_at>=? AND id!='baseline' ORDER BY created_at",
+            (batch_started_at,),
+        )
+        failed = [r for r in batch_rows if r.get("status") in {"failed", "invalid"}]
+        unresolved = [r for r in batch_rows if r.get("status") in ACTIVE_STATUSES]
+        if any(isinstance(result, MainRepoModified) for result in results):
+            return False
+        if any(isinstance(result, BaseException) for result in results):
+            self.set_state(HarnessState.PAUSED_FOR_HUMAN, "batch task raised an exception; no new plans will be generated")
+            return True
+        measured = [r for r in batch_rows if r.get("metric") is not None]
+        if unresolved or not measured:
+            # Plan again only on new evidence; consecutive-failure streaks are bounded by [stop]/[budget] limits.
+            self.set_state(HarnessState.PAUSED_FOR_HUMAN, f"batch produced no usable evidence: failed={len(failed)} unresolved={len(unresolved)}")
+            return True
+        await self.maybe_meta_review()
+        return True
+
+    def _acquire_lock(self) -> None:
+        """One controller per campaign: a second one would double-schedule GPUs and agents."""
+        self._lock = open(ensure_dir(self.cfg.state_dir) / "controller.lock", "w")
+        try:
+            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit(f"another controller is already running on {self.cfg.state_dir}; stop it first") from None
+        self._lock.write(str(os.getpid()))
+        self._lock.flush()
+
     async def run(self) -> None:
+        self._acquire_lock()
         if not self.db.experiment("baseline"):
             await self.initialize()
+        elif not self.db.query("SELECT 1 FROM immutable_hashes LIMIT 1"):
+            n = record_immutable_hashes(self.cfg, self.db)
+            self.events.emit("integrity", f"recorded {n} immutable file hashes for imported baseline", source="INIT")
         self.dashboard.start()
         if self.dashboard.address:
             host, port = self.dashboard.address
             self.events.emit("dashboard", f"Research Console: http://{host}:{port}", source="CONTROLLER")
         self.db.set_meta("started_at", self.db.get_meta("started_at", time.time()))
         self.db.set_meta("control", {})  # explicit run ignores stale stop/pause commands from an earlier process
+        self._settle_inflight("controller exited before settlement")
         self.set_state(HarnessState.RUNNING)
         self._control_task = asyncio.create_task(self._control_watch())
         try:
             while not self._stop_requested.is_set():
                 if not await self._wait_if_paused():
                     break
-                decision = self.stop_policy.evaluate()
-                if decision.state:
-                    if decision.state == HarnessState.PAUSED_FOR_HUMAN:
-                        await self.analyze_plateau(decision.reason)
-                    self.set_state(decision.state, decision.reason)
-                    if decision.state == HarnessState.PAUSED_FOR_HUMAN:
-                        continue
-                    if decision.state in TERMINAL_STATES:
-                        break
-                violations = verify_immutable_hashes(self.cfg, self.db)
-                if violations:
-                    self.set_state(HarnessState.SAFETY_STOP, "; ".join(violations))
+                self._iteration = asyncio.create_task(self._iterate())
+                await asyncio.wait({self._iteration})
+                if self._iteration.cancelled():
+                    continue  # pause/stop interrupted this iteration; loop re-checks state
+                if not self._iteration.result():
                     break
-                candidates = await self.generate_candidates()
-                if not candidates:
-                    self.set_state(HarnessState.PAUSED_FOR_HUMAN, "agents produced no valid hypotheses; human insight requested")
-                    continue
-                selected = await self.select_candidates(candidates)
-                self.events.emit("batch", f"selected {len(selected)} experiments", source="CONTROLLER")
-                tasks = [asyncio.create_task(self.run_candidate(c)) for c in selected]
-                await asyncio.gather(*tasks, return_exceptions=True)
-                self.refresh_champion()
-                await self.maybe_meta_review()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -493,5 +664,9 @@ class ResearchController:
         finally:
             if self._control_task:
                 self._control_task.cancel()
+            if self._iteration and not self._iteration.done():
+                await self._interrupt("controller shutdown")
             await self.agents.close()
+            # The control task that ran the interrupt may itself have been cancelled mid-way; close what remains.
+            self._settle_inflight("controller shutdown")
             self.dashboard.stop()

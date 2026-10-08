@@ -32,7 +32,7 @@ def create_worktree(cfg: Config, experiment_id: str, parent_commit: str) -> Path
     path = cfg.worktree_dir / experiment_id
     if path.exists():
         return path
-    branch = f"rsi/{experiment_id}"
+    branch = f"rsi/{cfg.state_dir.name}/{experiment_id}"  # campaign-scoped: ids restart per campaign
     r = run_capture(["git", "worktree", "add", "-b", branch, str(path), parent_commit], cwd=cfg.repo, check=False)
     if r.returncode != 0:
         # Branch may already exist after a controller restart.

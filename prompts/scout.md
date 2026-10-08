@@ -21,3 +21,5 @@ Return STRICT JSON only:
 }
 
 Do not modify code. Do not redefine the metric or evaluator.
+
+Every hypothesis must be implementable in under 40 tool calls as a small edit to the files listed in the CODEBASE MAP (when provided), and testable by the quick stage. `changes_hint` must name the exact file and function to change and what to change in it. Hypotheses that need components not in the codebase (new models, datasets, training) will be rejected.

@@ -9,6 +9,21 @@ from rsi_harness.dashboard import DashboardServer
 from rsi_harness.db import ResearchDB
 
 ROOT = Path(__file__).resolve().parent.parent
+# Local test server: never route through the host's HTTP proxy.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def call(base: str, path: str, payload: dict | None = None) -> dict:
+    """GET (no payload) or JSON POST against the local test dashboard only."""
+    url = base + path
+    if not url.startswith("http://127.0.0.1:"):
+        raise ValueError(f"refusing non-local URL: {url}")
+    data = None if payload is None else json.dumps(payload).encode()
+    req = urllib.request.Request(  # noqa: S310 - scheme and host checked above
+        url, data=data, headers={"Content-Type": "application/json"}, method="GET" if data is None else "POST"
+    )
+    with _OPENER.open(req) as r:
+        return json.load(r)
 
 
 class TestDashboard(unittest.TestCase):
@@ -30,52 +45,28 @@ class TestDashboard(unittest.TestCase):
             srv = DashboardServer(cfg, db, ROOT / "dashboard" / "index.html")
             srv.start()
             try:
-                host, port = srv.address
-                base = f"http://{host}:{port}"
-                with urllib.request.urlopen(base + "/api/state") as r:
-                    state = json.load(r)
+                address = srv.address
+                assert address is not None
+                base = f"http://{address[0]}:{address[1]}"
+
+                state = call(base, "/api/state")
                 self.assertEqual(state["experiment_count"], 1)
                 self.assertIn("idea_queue", state)
 
-                req = urllib.request.Request(
-                    base + "/api/ideas",
-                    data=json.dumps({"action": "add", "text": "Explore alternative loss", "experiment_id": eid}).encode(),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req) as r:
-                    out = json.load(r)
+                out = call(base, "/api/ideas", {"action": "add", "text": "Explore alternative loss", "experiment_id": eid})
                 self.assertTrue(out["ok"])
-                idea_id = out["id"]
-
-                req = urllib.request.Request(
-                    base + "/api/ideas",
-                    data=json.dumps({"action": "send", "id": idea_id}).encode(),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req) as r:
-                    self.assertTrue(json.load(r)["ok"])
+                self.assertTrue(call(base, "/api/ideas", {"action": "send", "id": out["id"]})["ok"])
                 self.assertEqual(db.recent_guidance(1)[0]["kind"], "idea")
 
-                req = urllib.request.Request(
-                    base + "/api/node",
-                    data=json.dumps({"action": "branch", "experiment_id": eid, "insight": "Revisit with better schedule"}).encode(),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req) as r:
-                    self.assertTrue(json.load(r)["ok"])
-                self.assertEqual(db.experiment(eid)["pinned"], 1)
+                # The page sends experiment_id=null when no node is attached; that must not be read as "None".
+                self.assertTrue(call(base, "/api/ideas", {"action": "add", "text": "Unattached idea", "experiment_id": None})["ok"])
 
-                req = urllib.request.Request(
-                    base + "/api/control",
-                    data=json.dumps({"action": "pause"}).encode(),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req) as r:
-                    self.assertTrue(json.load(r)["ok"])
+                self.assertTrue(call(base, "/api/node", {"action": "branch", "experiment_id": eid, "insight": "Revisit with better schedule"})["ok"])
+                exp = db.experiment(eid)
+                assert exp is not None
+                self.assertEqual(exp["pinned"], 1)
+
+                self.assertTrue(call(base, "/api/control", {"action": "pause"})["ok"])
                 self.assertEqual(db.get_meta("control")["action"], "pause")
             finally:
                 srv.stop()

@@ -8,3 +8,6 @@ __pycache__/
 *.pyc
 .venv/
 .test-sessions/
+rsi_start.log
+.ruff_cache/
+.pytest_cache/

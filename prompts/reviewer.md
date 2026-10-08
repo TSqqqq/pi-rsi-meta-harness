@@ -16,3 +16,5 @@ Return STRICT JSON only:
     {"parameter": "lr", "from": "3e-4", "to": "2e-4", "effect": 0.12, "confidence": 0.7}
   ]
 }
+
+NOISE: re-running the same configuration changes the metric by run-to-run noise. A |delta| smaller than objective.min_meaningful_delta is noise: say the result is inconclusive, never that the mechanism works or is counterproductive.

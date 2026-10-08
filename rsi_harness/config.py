@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-import tomllib
-from dataclasses import dataclass, field
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +18,7 @@ class Config:
     raw: dict[str, Any]
 
     @classmethod
-    def load(cls, path: str | Path) -> "Config":
+    def load(cls, path: str | Path) -> Config:
         p = Path(path).expanduser().resolve()
         raw = tomllib.loads(p.read_text(encoding="utf-8"))
         return cls(path=p, base_dir=p.parent, raw=raw)
@@ -41,21 +44,30 @@ class Config:
     def db_path(self) -> Path:
         return self.state_dir / "research.sqlite3"
 
+    def campaign_path(self, key: str, name: str) -> Path:
+        # Per-campaign data defaults to state_dir so campaigns never share Pi sessions, worktrees or logs.
+        raw = self.get("project", key)
+        return resolve(self.base_dir, raw) if raw else self.state_dir / name
+
     @property
     def worktree_dir(self) -> Path:
-        return self.project_path("worktree_dir", "./worktrees")
+        return self.campaign_path("worktree_dir", "worktrees")
 
     @property
     def artifact_dir(self) -> Path:
-        return self.project_path("artifact_dir", "./artifacts")
+        return self.campaign_path("artifact_dir", "artifacts")
 
     @property
     def session_dir(self) -> Path:
-        return self.project_path("session_dir", "./sessions")
+        return self.campaign_path("session_dir", "sessions")
+
+    @property
+    def transcript_dir(self) -> Path:
+        return self.campaign_path("transcript_dir", "transcripts")
 
     @property
     def log_dir(self) -> Path:
-        return self.project_path("log_dir", "./logs")
+        return self.campaign_path("log_dir", "logs")
 
     @property
     def direction(self) -> str:

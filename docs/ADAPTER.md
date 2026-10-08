@@ -25,7 +25,21 @@ Command templates receive:
 {stage}
 {seed}
 {gpu_ids}
+{python}
 ```
+
+plus every key of `[experiment]` (paper-specific knobs such as `{lr}`).
+
+## 2b. Paper-specific agent context
+
+- `[project] codebase_map`: a short Markdown map appended to scout and worker prompts (template:
+  `prompts/codebase.example.md`). List the mutable files with key functions and line ranges, how the metric
+  is computed, the baseline value and its noise, and the components the paper mentions that are **not** in
+  the code. This is the single biggest factor in whether a small worker model finishes within its budget.
+- `[project] idea_file`: optional research note injected into every scout turn.
+- Keep large model/data caches out of worktrees: link them to one shared, pre-populated cache and run offline,
+  otherwise every experiment silently re-downloads (see `docs/LESSONS.md`).
+- Run the baseline twice with the same config and set `[objective] min_meaningful_delta` above the observed gap.
 
 ## 3. Evaluator contract
 
