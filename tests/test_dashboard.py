@@ -22,6 +22,8 @@ def call(base: str, path: str, payload: dict | None = None) -> dict:
     req = urllib.request.Request(  # noqa: S310 - scheme and host checked above
         url, data=data, headers={"Content-Type": "application/json"}, method="GET" if data is None else "POST"
     )
+    # An HTTP request to the local test server (host checked above), not a file path.
+    # pi-lens-ignore: python-path-traversal
     with _OPENER.open(req) as r:
         return json.load(r)
 

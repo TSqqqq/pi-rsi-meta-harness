@@ -36,11 +36,35 @@ METHOD_ARGS = ("model_path", "device")  # add your knobs here; never data or out
 DRIVER_DIR = tempfile.mkdtemp(prefix="rsi-driver-")  # read-only copy of this file for the sandboxed children
 
 
+# ---------- file helpers: every failure is one clear message naming the file ----------
+def read_json(path, what):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"cannot read {what} {path}: {exc}") from exc
+
+
+def parse_json_line(line, what):
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"malformed {what}: {exc}: {line[:200]!r}") from exc
+
+
+def write_text(path, text, what):
+    try:
+        with open(path, "w") as f:
+            f.write(text)
+    except OSError as exc:
+        raise SystemExit(f"cannot write {what} {path}: {exc}") from exc
+
+
 # ---------- benchmark format: adapt these three ----------
 def read_items(data_dir):
     """Groups of items: [[item, item, ...], ...]. Items of one group must never meet in one process."""
-    with open(os.path.join(data_dir, "test.json")) as f:
-        return [[x] for x in json.load(f)]  # ungrouped benchmark: every group has one item
+    items = read_json(os.path.join(data_dir, "test.json"), "benchmark items")
+    return [[x] for x in items]  # ungrouped benchmark: every group has one item
 
 
 def item_input(data_dir, item):
@@ -52,8 +76,7 @@ def write_predictions(groups, predictions, out_path):
     for g, group in enumerate(groups):
         for k, item in enumerate(group):
             item["prediction"] = predictions[f"{g}:{k}"]
-    with open(out_path, "w") as f:
-        json.dump(groups, f, indent=2)
+    write_text(out_path, json.dumps(groups, indent=2), "predictions")
 
 
 # ---------- fixed part ----------
@@ -95,10 +118,9 @@ def sandbox_prefix(binds, writable):
 
 def run_child(code_dir, method_args, out_path):
     answer = load_method(code_dir).load(types.SimpleNamespace(**method_args))
-    jobs = [json.loads(line) for line in sys.stdin]
-    with open(out_path, "w") as out:
-        for job in jobs:
-            out.write(json.dumps({"k": job["k"], "prediction": answer(job["input"])}) + "\n")
+    jobs = [parse_json_line(line, "job from the driver") for line in sys.stdin]
+    lines = [json.dumps({"k": job["k"], "prediction": answer(job["input"])}) + "\n" for job in jobs]
+    write_text(out_path, "".join(lines), "shard answers")
 
 
 def run_shard(args, binds, jobs):
@@ -114,9 +136,23 @@ def run_shard(args, binds, jobs):
     proc.stdin.close()
     if proc.wait() != 0:
         raise SystemExit(f"method process failed (rc={proc.returncode})")
-    with open(out_path) as f:
-        results = {r["k"]: r["prediction"] for r in map(json.loads, f)}
-    shutil.rmtree(xdir, ignore_errors=True)
+    try:
+        with open(out_path) as f:
+            lines = f.read().splitlines()
+    except OSError as exc:
+        raise SystemExit(f"method process wrote no answers ({out_path}): {exc}") from exc
+    # Only the keys this shard was given are accepted: the method process cannot touch other answers.
+    expected = {job["k"] for job in jobs}
+    results = {}
+    for line in lines:
+        r = parse_json_line(line, "answer from the method process")
+        if r.get("k") not in expected:
+            raise SystemExit(f"method process returned an answer for an item it was not given: {r.get('k')!r}")
+        results[r["k"]] = r["prediction"]
+    try:
+        shutil.rmtree(xdir)
+    except OSError:
+        pass  # a leftover temp dir is harmless; the answers are already read
     return results
 
 
@@ -134,8 +170,11 @@ def main():
     args = p.parse_args()
     args.code_dir = os.path.realpath(args.code_dir)
     if args.child:
-        return run_child(args.code_dir, json.loads(args.method_args), args.answers)
-    shutil.copy(os.path.abspath(__file__), os.path.join(DRIVER_DIR, os.path.basename(__file__)))
+        return run_child(args.code_dir, parse_json_line(args.method_args, "--method_args"), args.answers)
+    try:
+        shutil.copy(os.path.abspath(__file__), os.path.join(DRIVER_DIR, os.path.basename(__file__)))
+    except OSError as exc:
+        raise SystemExit(f"cannot stage the driver for the sandbox in {DRIVER_DIR}: {exc}") from exc
     groups = read_items(args.data_dir)
     binds = [args.code_dir, os.path.realpath(args.model_path), os.path.realpath(args.inputs_dir), sys.prefix,
              os.path.realpath(sys.prefix)]
