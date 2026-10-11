@@ -35,7 +35,6 @@ def cmd_status(cfg: Config, db: ResearchDB) -> int:
         "experiments": db.completed_count(),
         "gpu_hours": gpu["x"],
         "agent_tokens": tok["x"],
-        "active_policy": db.get_meta("active_policy", {}),
     }
     print(json.dumps(out, ensure_ascii=False, indent=2))
     return 0
@@ -52,7 +51,9 @@ def cmd_rebase_baseline(cfg: Config, db: ResearchDB, ns) -> int:
     if old_metric is not None and abs(float(old_metric) - ns.metric) > ns.tolerance:
         raise SystemExit(f"baseline {ns.stage} changed {old_metric} -> {ns.metric} (> tolerance {ns.tolerance}); not behavior-preserving")
     # The re-run is one more measurement of the same configuration: keep both, compare against their mean.
-    db.add_metric("baseline", ns.stage, None, ns.metric, {"rebase_commit": new_commit, "evidence": ns.evidence})
+    # --no-new-run: the commit changed only harness files, so nothing was re-measured; no metric is added.
+    if not ns.no_new_run:
+        db.add_metric("baseline", ns.stage, None, ns.metric, {"rebase_commit": new_commit, "evidence": ns.evidence})
     stages[ns.stage] = db.metric_mean("baseline", ns.stage)
     db.update_experiment("baseline", git_commit=new_commit)
     db.set_meta("baseline_commit", new_commit)
@@ -85,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
     reject = sub.add_parser("reject-dependency"); reject.add_argument("package"); reject.add_argument("--reason", default="rejected by human")
     rebase = sub.add_parser("rebase-baseline", help="branch new experiments from the current HEAD after re-measuring the baseline")
     rebase.add_argument("--stage", default="quick"); rebase.add_argument("--metric", type=float, required=True)
+    rebase.add_argument("--no-new-run", action="store_true", help="only harness files changed: move the commit, record no measurement")
     rebase.add_argument("--evidence", required=True, help="evaluation result file of the baseline re-run at HEAD")
     rebase.add_argument("--tolerance", type=float, default=0.01, help="max |old-new| attributed to run-to-run noise")
     ns = ap.parse_args(argv)
@@ -107,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
         db.add_guidance(ns.text, kind="note"); print("Human research note recorded."); return 0
     if ns.cmd == "pin":
         if not db.experiment(ns.experiment_id): raise SystemExit(f"Unknown experiment: {ns.experiment_id}")
-        db.update_experiment(ns.experiment_id, pinned=1); print(f"Pinned {ns.experiment_id} to the frontier."); return 0
+        db.update_experiment(ns.experiment_id, pinned=1); print(f"Pinned {ns.experiment_id}: it is never folded out of the scout's experiment tree."); return 0
     if ns.cmd == "branch":
         if not db.experiment(ns.experiment_id): raise SystemExit(f"Unknown experiment: {ns.experiment_id}")
         db.update_experiment(ns.experiment_id, pinned=1)

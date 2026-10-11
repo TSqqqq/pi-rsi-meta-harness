@@ -6,6 +6,19 @@ binary = "pi"
 sandbox = true
 # Global Pi extensions off for headless agents (interactive confirm dialogs block RPC; extra tools widen reach).
 extensions = false
+# Agents outside an experiment worktree (idea-digest, scout) only judge: read-only tools.
+readonly_tools = "read,grep,find,ls"
+# Every agent loads pi_extensions/rsi-context.ts: before each model call it drops earlier reasoning and replaces
+# tool outputs older than the last N turns by a one-line stub (calls stay visible), and blocks git log/show in
+# workers (their prompt has the lineage diff). The transcript keeps everything.
+trim_context = true
+keep_recent_tool_results = 2
+# No skill catalogue, prompt templates or auto-discovered AGENTS.md in agent sessions (harness rules appended once).
+minimal_resources = true
+# Extra Pi extensions loaded explicitly (all agents / read-only agents only). Output compressors that rewrite
+# text (e.g. pi-logzip) belong in readonly_extra_extensions: an editing agent must see source exactly as on disk.
+extra_extensions = []
+readonly_extra_extensions = []
 
 [project]
 name = "example-paper"
@@ -15,6 +28,7 @@ repo = "/absolute/path/to/example-paper"
 state_dir = "./state/campaign-1"
 # Paper-specific context injected into scout/worker prompts (both optional, see docs/ADAPTER.md).
 codebase_map = "./prompts/codebase.example.md"
+# Research note distilled once (cached by content hash) into a mechanism checklist shown to the scout.
 idea_file = ""
 
 [objective]
@@ -25,6 +39,8 @@ target = 78.5
 min_meaningful_delta = 0.10
 # Metric is read from the last JSON object printed by commands.evaluate.
 metric_json_key = "metric"
+# Secondary evaluator fields shown per experiment-tree node, so the scout can see why the main metric moved.
+side_metrics = []
 
 [commands]
 # Templates receive: {repo}, {worktree}, {experiment_id}, {stage}, {seed}, {gpu_ids}, {python},
@@ -39,6 +55,11 @@ full = "{python} train.py --config {worktree}/research_config.yaml --seed {seed}
 evaluate = "{python} evaluate.py --checkpoint outputs/{experiment_id}/{stage}/{seed}"
 # Optional lightweight command run after the worker edits code and before expensive training.
 preflight = "{python} -m compileall -q ."
+# Optional: run the patched code on a few samples first, so runtime bugs surface in ~1 min, not mid-stage.
+smoke = ""
+# Optional hook run on every new worktree ({worktree}, {baseline_commit}): adapt inherited experiment code to a
+# changed harness interface (e.g. a new fixed driver). Its stdout lists dropped inherited changes.
+migrate = ""
 
 [experiment]
 # Paper-specific knobs, available as {name} in command templates. Example:
@@ -48,6 +69,9 @@ preflight = "{python} -m compileall -q ."
 quick_min_delta = -0.05
 medium_min_delta = 0.05
 validation_seeds = [1, 2, 3]
+# A quick gain beyond single-run noise is re-measured until its mean rests on this many runs.
+quick_replicates = 3
+smoke_timeout_min = 5
 # ~3-4x the normal duration: caps hung runs (e.g. a stalled model download) without killing slow variants.
 quick_timeout_min = 30
 medium_timeout_min = 180
@@ -60,20 +84,12 @@ max_parallel = 8
 poll_seconds = 2
 
 [search]
+# Experiments per batch (also capped by resources.max_parallel). One scout plans the whole batch, best first.
 batch_size = 8
-scouts = 3
-meta_review_every = 25
-frontier_size = 12
-# Relative weights. They need not sum to 1.
-champion_weight = 25
-promising_weight = 20
-near_miss_weight = 15
-novel_weight = 15
-uncertain_weight = 10
-crossover_weight = 15
 
 [models]
-# single: use one model. dual: route insight-heavy work to planner and mechanical work to worker.
+# single: use one model. dual: planner (idea-digest, scout) and worker (implementation) tiers; override per task
+# with tiers = { implementation = "planner" }.
 mode = "single"
 # Empty means: keep Pi's currently selected/default model.
 # Cost guard: prompts to providers outside this list are refused before they are sent.
@@ -83,31 +99,35 @@ default = ""
 planner = ""
 worker = ""
 planner_thinking = "high"
-worker_thinking = "minimal"
-allow_escalation = true
-max_worker_failures_before_escalation = 2
-# Meta-RSI can suggest routing-policy changes, but cannot add providers/API keys.
-allow_policy_optimization = true
+worker_thinking = "high"
+tiers = {}
 
 [sessions]
 compact_at_percent = 82
 
+[context]
+# Character budget for the experiment tree in the scout briefing (~4 chars/token). Over budget, the least
+# informative leaves are folded into per-parent summaries; promising/pinned/recent nodes never fold.
+tree_chars = 60000
+
 [budget]
 max_gpu_hours = 1000
 max_wall_hours = 168
+# Processed tokens: new input per model call + output (the re-sent conversation prefix is not counted again).
 max_agent_tokens = 50000000
 max_experiments = 1000
 max_consecutive_crashes = 8
 
 [agents]
-# Hard per-task budgets for every Pi agent. Exceeding either aborts the run (no repair loop for aborts).
-max_tool_calls = 40
-worker_timeout_min = 10
-repair_timeout_min = 10
-
-[repair]
-# Bounded self-repair of a failed patch before the experiment is recorded as failed.
-max_attempts = 2
+# Hard per-task budgets for every Pi agent; exceeding one aborts the run.
+max_tool_calls = 80
+# The scout is asked for its answer at this many tool calls, and aborted 3 calls later.
+scout_max_tool_calls = 10
+scout_timeout_min = 60
+# A worker implements, then fixes its own runtime failures in the same session (fix_rounds follow-ups, each with
+# the traceback and the failing code); max_tool_calls and worker_timeout_min cover all of its turns together.
+worker_timeout_min = 40
+fix_rounds = 5
 
 [stop]
 # Consecutive worker failures before pausing for a human ("resume" resets the streak).
@@ -119,7 +139,10 @@ require_full_stage_for_target = true
 [files]
 # Patterns are checked against git diffs. Keep evaluator/test split immutable.
 mutable = ["model/**", "models/**", "train/**", "configs/**", "research_config.yaml"]
+# Immutable wins where both match. Put the fixed driver (examples/fixed_driver.py) and the scorer here.
 immutable = ["evaluate.py", "evaluation/**", "test/**", "tests/final/**", "data/splits/**"]
+# Harness files the experiment commands run from the worktree; synced to the baseline in every new worktree.
+harness_runtime = []
 
 [dependencies]
 allow_dynamic_pip = true

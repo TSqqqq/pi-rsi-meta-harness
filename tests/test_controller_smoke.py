@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import subprocess
 import tempfile
@@ -19,6 +20,7 @@ def make_campaign(td: Path) -> Config:
     repo = td / "repo"
     repo.mkdir()
     (repo / "train.py").write_text("print('train ok')\n")
+    (repo / ".gitignore").write_text("__pycache__/\n")  # as in a real project: run byproducts are not changes
     (repo / "evaluate.py").write_text(textwrap.dedent('''
         import argparse, json
         p=argparse.ArgumentParser(); p.add_argument('--id'); p.add_argument('--stage'); p.add_argument('--seed')
@@ -125,8 +127,12 @@ class TestControllerSmoke(unittest.TestCase):
             self.assertAlmostEqual(float(best["metric"]), 1.1)
             self.assertEqual(ctl.db.get_meta("state"), "TARGET_REACHED")
             self.assertTrue(bool(best["validated"]))
-            self.assertTrue(ctl.db.query("SELECT * FROM beliefs"))
-            self.assertTrue(ctl.db.query("SELECT * FROM parameter_effects"))
+            # No agent interprets results: the harness records the verdict, scouts read the tree next round.
+            self.assertFalse(ctl.db.query("SELECT 1 FROM agent_runs WHERE task_type='experiment_review'"))
+            self.assertEqual(ctl.db.experiment("exp_000001")["status"], "champion")
+            # One planner call per batch: no critic, meta-RSI or reviewer.
+            tasks = {r["task_type"] for r in ctl.db.query("SELECT task_type FROM agent_runs")}
+            self.assertEqual(tasks, {"hypothesis_generation", "implementation"})
             ctl.db.close()
 
 
@@ -189,6 +195,91 @@ class TestControllerSmoke(unittest.TestCase):
             self.assertEqual(ctl.db.get_meta("state"), "SAFETY_STOP")
             self.assertTrue(list((td / "artifacts" / "escapes").glob("*worker-exp_000001.diff")))
             self.assertFalse(ctl.db.query("SELECT 1 FROM metrics WHERE experiment_id='exp_000001'"))
+            ctl.db.close()
+
+    def test_every_agent_task_starts_a_fresh_session(self):
+        with tempfile.TemporaryDirectory() as td_s:
+            td = Path(td_s)
+            log = td / "pi.log"
+            cfg = make_campaign(td)
+            cfg.raw["pi"]["sandbox"] = False  # the sandbox (correctly) gives the agent a private /tmp
+            with mock.patch.dict(os.environ, {"FAKE_PI_LOG": str(log)}):
+                async def go():
+                    ctl = ResearchController(cfg, ROOT)
+                    await ctl.initialize()
+                    await asyncio.wait_for(ctl.run(), timeout=20)
+                    return ctl
+
+                ctl = asyncio.run(go())
+            tasks = ctl.db.one("SELECT COUNT(*) n FROM agent_runs")["n"]
+            self.assertGreater(tasks, 0)
+            self.assertEqual(log.read_text().count("new_session"), tasks)
+            self.assertEqual(log.read_text().count("prompt"), tasks)  # one message per task, no warm-up turn
+            ctl.db.close()
+
+    def test_human_edit_before_a_run_is_not_an_agent_escape(self):
+        with tempfile.TemporaryDirectory() as td_s:
+            td = Path(td_s)
+            cfg = make_campaign(td)
+
+            async def go():
+                ctl = ResearchController(cfg, ROOT)
+                await ctl.initialize()
+                (td / "repo" / "notes.txt").write_text("human edit while the campaign runs\n")  # dirty before any agent
+                await asyncio.wait_for(ctl.run(), timeout=20)
+                return ctl
+
+            ctl = asyncio.run(go())
+            self.assertEqual(ctl.db.get_meta("state"), "TARGET_REACHED")
+            ctl.db.close()
+
+    def test_continue_session_keeps_context_fresh_task_does_not(self):
+        with tempfile.TemporaryDirectory() as td_s:
+            td = Path(td_s)
+            log = td / "pi.log"
+            cfg = make_campaign(td)
+            cfg.raw["pi"]["sandbox"] = False
+
+            async def go():
+                ctl = ResearchController(cfg, ROOT)
+                kw = dict(agent_name="scout", role="scout", task_type="hypothesis_generation", cwd=cfg.repo, session_id="s")
+                await ctl.agents.run_task(prompt="first", **kw)
+                await ctl.agents.run_task(prompt="follow-up", continue_session=True, **kw)
+                await ctl.agents.close()
+                ctl.db.close()
+
+            with mock.patch.dict(os.environ, {"FAKE_PI_LOG": str(log)}):
+                asyncio.run(go())
+            self.assertEqual(log.read_text().count("new_session"), 1)  # only the first task reset the session
+            self.assertEqual(log.read_text().count("prompt"), 2)
+
+    def test_worker_fixes_its_own_failure_in_the_same_session(self):
+        with tempfile.TemporaryDirectory() as td_s:
+            td = Path(td_s)
+            log = td / "pi.log"
+            cfg = make_campaign(td)
+            cfg.raw["pi"]["sandbox"] = False
+
+            async def go():
+                ctl = ResearchController(cfg, ROOT)
+                await ctl.initialize()
+                await asyncio.wait_for(ctl.run(), timeout=30)
+                return ctl
+
+            with mock.patch.dict(os.environ, {"FAKE_PI_BREAK": "1", "FAKE_PI_LOG": str(log)}):
+                ctl = asyncio.run(go())
+            self.assertEqual(ctl.db.get_meta("state"), "TARGET_REACHED")
+            runs = [r["task_type"] for r in ctl.db.query("SELECT task_type FROM agent_runs ORDER BY id")]
+            self.assertEqual(runs.count("implementation"), 2)  # implement + one fix round
+            self.assertNotIn("repair", runs)
+            fixes = ctl.db.query("SELECT message FROM events WHERE type='worker_fix'")
+            self.assertEqual(len(fixes), 1)
+            self.assertIn("boom", fixes[0]["message"])
+            # The fix continued the worker's session: only the scout and the first worker turn reset it.
+            self.assertEqual(log.read_text().count("new_session"), runs.count("hypothesis_generation") + 1)
+            patch = (td / "artifacts" / "exp_000001" / "patch.diff").read_text()
+            self.assertIn("train fixed", patch)  # the complete change, fix included
+            self.assertNotIn("boom", patch)
             ctl.db.close()
 
     def test_disallowed_provider_is_refused(self):

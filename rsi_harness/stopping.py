@@ -40,7 +40,9 @@ class StopPolicy:
         if float(gpu["x"]) >= max_gpu:
             return StopDecision(HarnessState.BUDGET_EXHAUSTED, f"GPU-hour budget reached: {gpu['x']:.2f}/{max_gpu:.2f}")
 
-        tok = self.db.one("SELECT COALESCE(SUM(total_tokens),0) AS x FROM agent_runs") or {"x": 0}
+        # Processed tokens: new input per model call + output. The conversation prefix re-sent on every turn is
+        # served by the prefix cache; runs recorded before per-call accounting count their whole input.
+        tok = self.db.one("SELECT COALESCE(SUM(COALESCE(fresh_input_tokens, input_tokens) + output_tokens),0) AS x FROM agent_runs") or {"x": 0}
         max_tok = int(self.cfg.get("budget", "max_agent_tokens", 2**63-1))
         if int(tok["x"]) >= max_tok:
             return StopDecision(HarnessState.BUDGET_EXHAUSTED, f"agent token budget reached: {tok['x']}/{max_tok}")

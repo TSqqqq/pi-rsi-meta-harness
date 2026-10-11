@@ -7,12 +7,12 @@ This repository is a **meta harness for metric-driven RSI-style research** over 
 It is not a single autonomous agent and it does not let an LLM own the lifecycle. It combines:
 
 - Pi RPC as the reasoning / code-editing runtime;
-- multiple role-specific Pi sessions;
+- two Pi agents: a planner-tier scout that plans each batch and one worker per experiment;
 - a durable experiment DAG in SQLite;
 - an event-driven Python controller;
 - staged experiments and objective evaluation;
 - model routing between planner and worker models already configured in Pi;
-- additive Pi skills, including existing user skills such as subagents;
+- a fixed, sandboxed benchmark driver so the method cannot exploit the evaluation;
 - a browser-based Research Console for observation and human intervention;
 - hard stop, budget, evaluator-integrity, and dependency boundaries.
 
@@ -27,31 +27,20 @@ Human / Research Console
         │
         ▼
 Meta Harness Controller
-  ├─ state machine
-  ├─ session manager
-  ├─ model router
-  ├─ context builder
-  ├─ frontier selector
-  ├─ GPU/process scheduler
-  ├─ stop/budget policy
-  ├─ integrity checks
-  └─ event stream
-        │ Pi RPC
+  ├─ state machine          ├─ GPU/process scheduler
+  ├─ session manager        ├─ stop/budget policy
+  ├─ model router           ├─ noise verdicts + replication
+  ├─ context builder        ├─ integrity checks
+  └─ candidate validation   └─ event stream
+        │ Pi RPC (bwrap sandbox)
         ▼
-Agent hierarchy
-  ├─ Lead
-  ├─ Scouts
-  ├─ Critic
-  ├─ Workers
-  ├─ Reviewer
-  ├─ Meta-RSI
-  └─ Validator
+Agents: idea-digest (once per note) · scout (one per batch) · worker (one per experiment)
         │
         ▼
-Git worktrees → staged experiments → fixed evaluator
+Git worktrees → staged experiments → fixed driver (sandboxed method) → fixed scorer
         │
         ▼
-SQLite experiment DAG + beliefs + parameter effects + events
+SQLite experiment DAG + events + agent runs
 ```
 
 ## 3. Durable memory
@@ -65,11 +54,8 @@ The database stores:
 - hypotheses and mechanisms;
 - code provenance and artifact references;
 - success, failure, near-miss, crash, and validation state;
-- reusable lessons;
-- parameter effects;
-- research beliefs;
-- model/token/cost accounting;
-- research-policy versions;
+- rejected candidates with the reason;
+- model/token/cost accounting (fresh input per model call);
 - human guidance;
 - private human notes;
 - queued human ideas;
@@ -91,34 +77,29 @@ Each experiment points to one or more parents. A node may be:
 - failed / invalid;
 - champion.
 
-Multiple parents represent cross-branch combinations. The frontier selector does not follow only the current champion; it rewards performance, novelty, uncertainty, underexplored nodes, and explicitly pinned human choices.
+Multiple parents represent cross-branch combinations: the worker starts from the first parent's code and the other parents' patches are re-applied. The scout chooses parents itself from the full tree; a never-measured parent is replaced by its nearest measured ancestor.
 
-## 5. Agent hierarchy and session policy
+## 5. Agents and session policy
 
-Top-level agents are separate Pi RPC sessions:
+- **Idea-digest** — runs when the research note's content hash changes; distils the note into 4-10 testable
+  mechanisms (claim + mapping onto this codebase). The scout sees the list with how often each was tested.
+- **Scout** — one read-only planner-tier call per batch. It gets the raw record only: the experiment tree (each
+  node = plan + result, or why it never ran), rejected candidates with reasons, where each exact patch is, the
+  idea mechanisms and human guidance. It returns the whole batch, best first. It proposes directions; the
+  worker works out the code.
+- **Worker** — one per experiment worktree. Its prompt contains the target function sources the scout named and
+  the full lineage diff. If preflight, smoke or a stage fails, the traceback and the failing functions' source
+  go back to the same session (up to `fix_rounds`); a result that ran is never "fixed".
 
-- **Lead** — long-lived strategic context and plateau analysis.
-- **Scouts** — diverse hypothesis generation; may internally use installed subagent skills.
-- **Critic** — ranks a candidate batch.
-- **Worker** — one experiment/worktree/session; implementation-oriented.
-- **Reviewer** — attributes outcomes and updates lessons/beliefs/parameter effects.
-- **Meta-RSI** — periodically improves the search policy.
-- **Validator** — publication-grade replication and ablation when enabled.
-
-Existing Pi skills/extensions are not disabled. Harness role skills are loaded additively and marked `disable-model-invocation: true`; the harness explicitly initializes the relevant role skill once per role session, while normal user-installed skills such as subagents remain available.
+Every task starts a fresh Pi session; only follow-ups to the same task continue it. There is no critic, reviewer,
+meta-RSI or lead: conclusions are the scout's, and the controller keeps no strategy of its own.
 
 ## 6. Model routing
 
-Default mode uses Pi's normal model for every role.
-
-Optional dual mode defines:
-
-- `planner`: expensive/high-reasoning model for planning, hypotheses, critique, plateau analysis, cross-branch synthesis, and meta-RSI;
-- `worker`: cheaper model for implementation and repetitive tasks.
-
-Models must already be configured in Pi. The harness calls Pi RPC model-selection commands and never stores provider keys.
-
-Worker tasks can be escalated to the planner tier after repeated failure. Thinking level is also routed separately, so cheap/minimal, cheap/medium, strong/medium, and strong/high can be treated as different compute tiers.
+`single` mode uses one model for every task (thinking level per tier still applies). `dual` mode routes
+judgement (idea-digest, scout) to `planner` and implementation to `worker`; `[models].tiers` overrides any task.
+Models must already be configured in Pi; the harness never stores provider keys and refuses providers outside
+`allowed_providers` before sending anything.
 
 ## 7. Event-driven long-running execution
 
@@ -129,31 +110,25 @@ During a two-hour training run the controller monitors a subprocess and streams 
 A typical cycle is:
 
 ```text
-choose frontier
-→ scouts propose diverse falsifiable hypotheses
-→ critic selects a batch
-→ create independent git worktrees
+scout plans the batch from the raw record
+→ mechanical validation (knob values, parents with code, no exact re-run)
+→ independent git worktrees (harness files synced, inherited code migrated)
 → workers implement candidates
-→ integrity / preflight checks
-→ quick stage
-→ early reject or promote
-→ medium stage
-→ early reject / near-miss or promote
-→ full stage + configured seeds
-→ reviewer extracts lessons and parameter effects
+→ integrity / preflight / smoke checks (failures go back to the worker's session)
+→ quick stage → medium stage → full stage + configured seeds
+→ noise verdict; gains beyond single-run noise are re-measured
 → update DAG / champion
-→ periodic meta-RSI review
-→ next frontier
+→ next batch
 ```
 
 ## 8. Browser-first Research Console
 
 The browser console is the primary human interface. It provides:
 
-- full research DAG from baseline to current frontier;
+- full research DAG from baseline to the current champion;
 - metric trend from the beginning of the campaign;
 - live semantic event timeline;
-- per-node hypothesis, mechanism, stage, metrics, deltas, lessons, parents/children, parameter effects, patch preview, worker summary, and log tail;
+- per-node hypothesis, mechanism, stage, metrics, deltas, parents/children, patch preview, worker summary, and log tail;
 - active experiment and Pi-agent status;
 - model usage, token usage, cost, and GPU-hour budgets;
 - pause / resume / safe stop;
@@ -162,8 +137,7 @@ The browser console is the primary human interface. It provides:
 - a private research notebook that is not automatically sent to agents;
 - an idea queue that can send one or all drafts into the next research turn;
 - immediate RPC steering of a currently running top-level agent;
-- dependency approval/rejection;
-- plateau reports and active meta-RSI policy.
+- dependency approval/rejection.
 
 The console polls SQLite/process logs. This UI refresh consumes no LLM tokens.
 
@@ -190,19 +164,15 @@ The controller stops or pauses on:
 - explicit human stop;
 - plateau.
 
-A plateau normally enters `PAUSED_FOR_HUMAN`. A strong planner model produces a plateau report once, then the system waits. The human can add a new insight, revive a node, change configuration, or stop the campaign.
+A plateau normally enters `PAUSED_FOR_HUMAN` and the system waits. The human can add a new insight, revive a node, change configuration, or stop the campaign.
 
 ## 11. Safety and research integrity
 
-The harness may optimize:
+The scout may choose:
 
-- hypotheses;
-- frontier allocation;
-- exploration/exploitation ratio;
-- research prompts/policy;
-- model routing;
-- experiment budgets;
-- search spaces.
+- hypotheses and which branches to extend, revive or combine;
+- the split between new mechanisms and knob tuning;
+- the order of experiments in a batch.
 
 It must not autonomously redefine:
 
@@ -214,7 +184,7 @@ It must not autonomously redefine:
 - host permissions;
 - immutable files.
 
-The evaluator/test paths are hashed and checked. Final-test tuning and best-seed cherry-picking are explicitly outside the intended workflow.
+The evaluator/test paths are hashed and checked. The method is run only through a fixed driver that hides labels, earlier predictions, scores, item order and item grouping (`examples/fixed_driver.py`). Final-test tuning and best-seed cherry-picking are explicitly outside the intended workflow.
 
 ## 12. Dynamic dependencies
 

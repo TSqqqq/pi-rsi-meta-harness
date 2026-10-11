@@ -62,11 +62,13 @@ class PiRPC:
         pi_bin: str = "pi",
         on_event: EventCallback | None = None,
         extra_env: dict[str, str] | None = None,
-        skill_paths: list[Path] | None = None,
         append_system_prompt: Path | None = None,
         transcript_dir: Path | None = None,
         sandbox_writable: list[Path] | None = None,
         extensions: bool = True,
+        tools: str | None = None,
+        extension_paths: list[Path] | None = None,
+        minimal_resources: bool = False,
     ):
         self.cwd = cwd
         self.session_dir = session_dir
@@ -75,12 +77,16 @@ class PiRPC:
         self.pi_bin = pi_bin
         self.on_event = on_event
         self.extra_env = extra_env or {}
-        self.skill_paths = skill_paths or []
         self.append_system_prompt = append_system_prompt
         self.sandbox_writable = sandbox_writable  # None = unsandboxed
         self.extensions = extensions
+        self.tools = tools  # comma-separated allowlist; None keeps Pi's defaults
+        self.extension_paths = extension_paths or []  # loaded even when discovered extensions are off
+        self.minimal_resources = minimal_resources
         self.max_tool_calls: int | None = None
+        self.wrap_up: str | None = None
         self.tool_calls = 0
+        self.turn_inputs: list[int] = []  # context size of each model call in the current task
         # One local JSONL per session; every line is tagged with the agent_runs id for exact replay.
         self.transcript_path = (transcript_dir or session_dir / "transcripts") / f"{session_id}.jsonl"
         self.abort_reason: str | None = None
@@ -112,12 +118,17 @@ class PiRPC:
             "--session-dir", str(self.session_dir),
             "--name", self.name,
         ]
+        if self.tools:
+            args += ["--tools", self.tools]
         if not self.extensions:
             # Extensions can open interactive dialogs that block a headless agent, or add tools such as model switching.
             args.append("--no-extensions")
-        # Explicit harness skills are additive: discovered global/project skills remain enabled.
-        for skill in self.skill_paths:
-            args += ["--skill", str(skill)]
+        for ext in self.extension_paths:
+            args += ["--extension", str(ext)]
+        if self.minimal_resources:
+            # The role prompt is the whole instruction: no skill catalogue, templates or auto-discovered AGENTS.md
+            # (the harness appends its own rules once), so every turn carries less fixed context.
+            args += ["--no-skills", "--no-prompt-templates", "--no-context-files"]
         if self.append_system_prompt:
             args += ["--append-system-prompt", str(self.append_system_prompt)]
         if self.sandbox_writable is not None:
@@ -156,12 +167,21 @@ class PiRPC:
                 if rec.get("type") not in {"message_update", "tool_execution_update", "extension_ui_request"}:
                     # Deltas are redundant: message_end/tool_execution_end carry the authoritative content.
                     self._record("in", rec)
+                if rec.get("type") == "message_end" and (rec.get("message") or {}).get("role") == "assistant":
+                    # Context actually sent per model call: lets the harness separate new input from the
+                    # re-sent prefix that a prompt cache can serve.
+                    u = (rec.get("message") or {}).get("usage") or {}
+                    self.turn_inputs.append(int(u.get("input") or 0) + int(u.get("cacheRead") or 0))
                 if rec.get("type") == "tool_execution_start":
                     self.tool_calls += 1
-                    if self.max_tool_calls is not None and self.tool_calls > self.max_tool_calls and not self.abort_reason:
-                        # Never await a command from the reader: its response is read by this same task.
+                    # Never await a command from the reader: its response is read by this same task.
+                    if self.wrap_up and self.max_tool_calls is not None and self.tool_calls == self.max_tool_calls:
+                        # Soft limit: ask for the answer now, so the work done so far is not thrown away.
+                        self._steer_task = asyncio.create_task(self.steer(self.wrap_up))
+                    hard = None if self.max_tool_calls is None else self.max_tool_calls + (self.WRAP_UP_GRACE if self.wrap_up else 0)
+                    if hard is not None and self.tool_calls > hard and not self.abort_reason:
                         # Pi answers abort with agent_settled, which wakes prompt_and_wait.
-                        self._abort_task = asyncio.create_task(self.abort(f"tool call limit exceeded: {self.max_tool_calls}"))
+                        self._abort_task = asyncio.create_task(self.abort(f"tool call limit exceeded: {hard}"))
                 rid = rec.get("id")
                 if rec.get("type") == "response" and rid and rid in self._pending:
                     fut = self._pending.pop(rid)
@@ -237,9 +257,15 @@ class PiRPC:
                     await self.command({"type": "set_thinking_level", "level": levels[-1]})
         return model_data
 
-    async def prompt_and_wait(self, message: str, timeout: float = 1800.0, max_tool_calls: int | None = None) -> str:
+    WRAP_UP_GRACE = 3  # tool calls allowed after the wrap-up request before the hard abort
+
+    async def prompt_and_wait(self, message: str, timeout: float = 1800.0, max_tool_calls: int | None = None,
+                              wrap_up: str | None = None) -> str:
+        """Run one prompt. With wrap_up, reaching max_tool_calls steers the agent to answer now and the hard
+        abort comes WRAP_UP_GRACE calls later; without it, exceeding max_tool_calls aborts immediately."""
         self._settled.clear()
         self.max_tool_calls = max_tool_calls  # counted against self.tool_calls, which the caller resets per task
+        self.wrap_up = wrap_up
         self.abort_reason = None
         resp = await self.command({"type": "prompt", "message": message}, timeout=60.0)
         disposition = (resp.get("data") or {}).get("disposition")

@@ -84,20 +84,74 @@ def _json_candidates(text: str) -> list[str]:
     return sources
 
 
+def balance_brackets(text: str) -> str:
+    """Repair the commonest small-model JSON slip: a missing or extra closing bracket.
+
+    Walks the text outside of strings with a stack; a closer that does not match the innermost opener
+    first closes the missing inner brackets, an unmatched closer is dropped, and openers left at the end
+    are closed. Well-formed JSON is returned unchanged.
+    """
+    pairs = {"{": "}", "[": "]"}
+    out: list[str] = []
+    stack: list[str] = []
+    in_str = escaped = False
+    for ch in text:
+        if in_str:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in pairs:
+            stack.append(pairs[ch])
+        elif ch in "}]":
+            if ch not in stack:
+                continue  # unmatched closer
+            while stack[-1] != ch:
+                out.append(stack.pop())  # close what the writer forgot
+            stack.pop()
+        out.append(ch)
+    out.extend(reversed(stack))
+    return "".join(out)
+
+
 def parse_json_from_agent_text(text: str, required_key: str | None = None) -> Any:
     """Parse strict, fenced, think-wrapped, or lightly malformed JSON from an agent."""
     errors: list[str] = []
     for source in _json_candidates(text):
         candidate = re.sub(r",\s*([}\]])", r"\1", source.strip())
+        # A raw newline is never inside a JSON string, so a value followed by newline + key lacks a comma.
+        candidate = re.sub(r'("|\d|true|false|null|[}\]])(\s*\n\s*)(")', r"\1,\2\3", candidate)
         try:
             obj = json.loads(candidate)
         except json.JSONDecodeError as exc:
-            errors.append(str(exc))
-            continue
+            try:
+                obj = json.loads(balance_brackets(candidate))
+            except json.JSONDecodeError:
+                errors.append(str(exc))
+                continue
         if required_key is None or (isinstance(obj, dict) and required_key in obj):
             return obj
     suffix = f" containing {required_key!r}" if required_key else ""
     raise ValueError(f"Agent response was not valid JSON{suffix}: {errors[-1] if errors else 'no object found'}")
+
+
+def json_objects_with(text: str, keys: set[str]) -> list[dict[str, Any]]:
+    """Every parseable embedded object carrying all `keys`: salvages items from a malformed outer document."""
+    out: list[dict[str, Any]] = []
+    for source in _json_candidates(text):
+        try:
+            obj = json.loads(re.sub(r",\s*([}\]])", r"\1", source.strip()))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and keys <= obj.keys() and obj not in out:
+            out.append(obj)
+    return out
 
 
 def shell_template(template: str, **values: Any) -> str:

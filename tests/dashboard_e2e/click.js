@@ -66,7 +66,7 @@ const results = [];
   $("agentSelect").value = "worker-exp_000002";
   await sleep(3500);
   const kept = $("agentSelect").value;
-  $("steerInput").value = "only edit model/attention.py";
+  $("steerInput").value = "only edit run_inference_dtr.py";
   await click("实时纠偏", $("steerBtn"), () => (kept === "worker-exp_000002" && sql("select count(*) from human_guidance where kind='steer'") === "1") || `kept=${kept}`);
 
   // Node actions need a selection; the page auto-selects the best node only when one is validated, so select explicitly.

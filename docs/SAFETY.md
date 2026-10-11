@@ -8,16 +8,20 @@ Configure evaluator/test paths under `[files].immutable`. During initialization 
 
 Do not include mutable training code in the immutable list, and do include final evaluation logic/data split manifests when practical.
 
-## The meta-RSI agent may change/suggest
+## The scout may change
 
-- exploration vs exploitation allocation
-- which historical nodes to revive
-- scout roles
-- hypothesis-generation policy
-- candidate batch size and fidelity allocation
-- model-routing thresholds
-- numeric search spaces
-- which mechanism families deserve more compute
+- which branches to extend, revive or combine
+- the split of a batch between new mechanisms and knob tuning
+- which experiments to run first
+
+## Benchmark integrity
+
+Experiments must improve the model, not the score. The evaluator therefore runs the method only through a fixed
+driver (template `examples/fixed_driver.py`, kept in an immutable path): the method runs in a sandbox that sees
+its code, the model and the raw inputs; it gets one test item at a time, shuffled; grouped items go to separate
+processes. The scout prompt also forbids benchmark exploits explicitly. Keep a regression test with a fake
+method that tries every known leak (reading labels, earlier predictions, scores; writing files; relating grouped
+items through shared state) and assert that all of them fail.
 
 ## It must not change
 

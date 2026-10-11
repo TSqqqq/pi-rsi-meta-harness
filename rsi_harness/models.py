@@ -7,15 +7,13 @@ from .config import Config
 from .util import split_model
 
 
-PLANNER_TASKS = {
-    "research_planning",
-    "hypothesis_generation",
-    "candidate_critique",
-    "failure_synthesis",
-    "cross_branch_reasoning",
-    "meta_rsi",
-    "plateau_analysis",
-    "paper_validation",
+# Which of the two model tiers each agent task uses. Judgement that steers the whole search runs on the
+# planner (strong) model; mechanical, high-volume code edits run on the worker model. Override per task in
+# [models.tiers]; a worker task escalates to the planner after repeated failures (allow_escalation).
+DEFAULT_TIERS = {
+    "research_planning": "planner",      # idea-digest: distil the research note into a mechanism checklist (once)
+    "hypothesis_generation": "planner",  # scout: read the experiment tree, plan the next batch
+    "implementation": "worker",          # worker: implement one hypothesis as a patch
 }
 
 
@@ -39,9 +37,10 @@ class ModelRouter:
         self.failures_before_escalation = int(cfg.get("models", "max_worker_failures_before_escalation", 2))
 
     def route(self, task_type: str, failures: int = 0, force_tier: str | None = None) -> ModelRoute:
+        tiers = {**DEFAULT_TIERS, **dict(self.cfg.get("models", "tiers", {}) or {})}
+        tier = force_tier or tiers.get(task_type, "worker")
         if self.mode == "single":
-            return ModelRoute(self.default or None, self.planner_thinking if task_type in PLANNER_TASKS else self.worker_thinking, "single")
-        tier = force_tier or ("planner" if task_type in PLANNER_TASKS else "worker")
+            return ModelRoute(self.default or None, self.planner_thinking if tier == "planner" else self.worker_thinking, "single")
         if tier == "worker" and self.allow_escalation and failures >= self.failures_before_escalation:
             tier = "planner"
         if tier == "planner":

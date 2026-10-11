@@ -18,7 +18,7 @@ The console can:
 
 - pause / resume / safely stop a campaign;
 - click any experiment node for hypothesis, metrics, parameter effects, worker summary, patch preview, logs, parents, and children;
-- pin/unpin an old node to the frontier;
+- pin/unpin an old node (pinned nodes are never folded out of the scout's experiment tree);
 - continue from a selected node with a human scientific insight;
 - maintain a private research notebook that is **not** automatically injected into agent context;
 - keep an idea queue, then send one idea or all ideas into the **next research turn**;

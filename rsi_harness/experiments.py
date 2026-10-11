@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import statistics
@@ -25,6 +26,19 @@ class StageResult:
     std: float
     gpu_hours: float
     extra: list[dict[str, Any]]
+
+
+def error_tail(log: Path, n: int = 12) -> str:
+    """The traceback lines that explain a failure, so a repair agent sees the cause instead of rc=1."""
+    if not log.exists():
+        return ""
+    lines = [x.rstrip() for x in log.read_text(encoding="utf-8", errors="replace").replace("\r", "\n").splitlines()]
+    starts = [i for i, x in enumerate(lines) if x.startswith("Traceback")]
+    if not starts:
+        return "\n".join(lines[-n:])
+    # The first traceback is the real cause; later ones are wrappers (e.g. the adapter's CalledProcessError).
+    first = lines[starts[0]:starts[1] if len(starts) > 1 else None]
+    return "\n".join(first[-n:])
 
 
 class ExperimentRunner:
@@ -112,6 +126,23 @@ class ExperimentRunner:
         for proc in active:
             self._terminate(proc, force=True)
 
+    def params(self, eid: str) -> dict[str, Any]:
+        """Effective knobs of an experiment: [experiment] defaults overridden by its recorded params."""
+        row = self.db.experiment(eid) or {}
+        return {**self.cfg.section("experiment"), **json.loads(row.get("params_json") or "{}")}
+
+    def noise(self, stage: str, n: int) -> float:
+        """Smallest |delta| distinguishable from run-to-run noise for an n-run mean vs the baseline mean.
+
+        k * sigma * sqrt(1/n + 1/n_base), sigma = std of repeated baseline runs; never below min_meaningful_delta.
+        """
+        _, sigma, n_base = self.db.metric_stats("baseline", stage)
+        floor = float(self.cfg.get("objective", "min_meaningful_delta", 0.0))
+        if n_base < 2:
+            return floor
+        k = float(self.cfg.get("objective", "noise_sigmas", 2.0))
+        return max(floor, k * sigma * (1 / max(1, n) + 1 / n_base) ** 0.5)
+
     def _values(self, eid: str, worktree: Path, stage: str, seed: int, gpu_ids: list[int]) -> dict[str, Any]:
         venv_root_raw = str(self.cfg.get("dependencies", "venv_root", "") or "")
         venv_root = Path(venv_root_raw).expanduser() if venv_root_raw else (self.cfg.state_dir / "venvs")
@@ -120,8 +151,7 @@ class ExperimentRunner:
         vpy = venv_root / eid / "bin" / "python"
         python_bin = str(vpy) if vpy.exists() else sys.executable
         return {
-            # Paper-specific knobs: every key of [experiment] becomes a {placeholder}; built-ins below win on clashes.
-            **self.cfg.section("experiment"),
+            **self.params(eid),
             "repo": self.cfg.repo,
             "worktree": worktree,
             "experiment_id": eid,
@@ -141,7 +171,24 @@ class ExperimentRunner:
         env = os.environ.copy()
         rc, out, _ = await self._run_command(template, cwd=worktree, env=env, log_path=log, source=f"{eid}:PREFLIGHT", timeout_s=600)
         if rc != 0:
-            raise RuntimeError(f"preflight failed for {eid}: rc={rc}")
+            raise RuntimeError(f"preflight failed for {eid}: rc={rc}\n{error_tail(log)}")
+        await self.smoke(eid, worktree)
+
+    async def smoke(self, eid: str, worktree: Path) -> None:
+        """Run the patched code on a couple of samples: runtime bugs surface in ~1 min, not mid-stage."""
+        template = str(self.cfg.get("commands", "smoke", "") or "")
+        if not template:
+            return
+        timeout_min = float(self.cfg.get("stages", "smoke_timeout_min", 5))
+        async with self.scheduler.acquire() as alloc:
+            env = os.environ.copy()
+            if alloc.gpu_ids:
+                env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, alloc.gpu_ids))
+            cmd = shell_template(template, **self._values(eid, worktree, "smoke", 0, alloc.gpu_ids))
+            log = self.cfg.log_dir / "experiments" / f"{eid}.smoke.log"
+            rc, _, _ = await self._run_command(cmd, cwd=worktree, env=env, log_path=log, source=f"{eid}:SMOKE", timeout_s=timeout_min * 60)
+        if rc != 0:
+            raise RuntimeError(f"smoke run failed for {eid}: rc={rc}\n{error_tail(log)}")
 
     async def run_stage(self, eid: str, worktree: Path, stage: str, seeds: list[int]) -> StageResult:
         train_template = str(self.cfg.get("commands", stage, "") or "")
@@ -169,7 +216,7 @@ class ExperimentRunner:
                 )
                 total_gpu_hours += elapsed * len(gpu_ids) / 3600.0
                 if rc != 0:
-                    raise RuntimeError(f"training failed: stage={stage} seed={seed} rc={rc}")
+                    raise RuntimeError(f"training failed: stage={stage} seed={seed} rc={rc}\n{error_tail(log)}")
 
                 eval_cmd = shell_template(eval_template, **vals)
                 elog = self.cfg.log_dir / "experiments" / f"{eid}.{stage}.seed{seed}.eval.log"
@@ -212,6 +259,13 @@ class ExperimentRunner:
                 parent_stage = baseline_stage
             self.db.update_experiment(eid, stage=stage, status="running")
             result = await self.run_stage(eid, worktree, stage, seeds)
+            replicates = int(self.cfg.get("stages", f"{stage}_replicates", 1))
+            if replicates > 1 and self.cfg.delta(result.mean, baseline_stage) >= self.noise(stage, 1):
+                # A gain cleared single-run noise: re-measure before anything is built on it (losses need no proof).
+                extra = await self.run_stage(eid, worktree, stage, list(range(seeds[-1] + 1, seeds[-1] + replicates)))
+                all_runs = result.metrics + extra.metrics
+                result = StageResult(stage, all_runs, statistics.fmean(all_runs), statistics.stdev(all_runs),
+                                     result.gpu_hours + extra.gpu_hours, result.extra + extra.extra)
             total_gpu += result.gpu_hours
             delta_parent = self.cfg.delta(result.mean, parent_stage)
             delta_baseline = self.cfg.delta(result.mean, baseline_stage)
@@ -225,7 +279,7 @@ class ExperimentRunner:
                 gpu_hours=total_gpu,
                 stage=stage,
             )
-            self.events.emit("stage_done", f"{stage} mean={result.mean:.6g} Δparent={delta_parent:+.6g} Δstage-baseline={delta_baseline:+.6g}", source=eid)
+            self.events.emit("stage_done", f"{stage} mean={result.mean:.6g} n={len(result.metrics)} Δparent={delta_parent:+.6g} Δstage-baseline={delta_baseline:+.6g} noise=±{self.noise(stage, len(result.metrics)):.3g}", source=eid)
             final = result
             if stage == "quick":
                 threshold = float(self.cfg.get("stages", "quick_min_delta", -0.05))

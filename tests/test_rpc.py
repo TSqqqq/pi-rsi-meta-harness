@@ -51,6 +51,32 @@ class TestPiRPC(unittest.TestCase):
             self.assertIn('"ok"', await c.prompt_and_wait("hello", timeout=10))
         self.run_with_client(body)
 
+    def test_wrap_up_steers_before_the_hard_limit(self):
+        async def body(c):
+            c.tool_calls = 0
+            with self.assertRaises(AgentAborted) as cm:
+                await c.prompt_and_wait("LOOP_TOOLS", timeout=10, max_tool_calls=3, wrap_up="answer now")
+            self.assertIn(f"tool call limit exceeded: {3 + c.WRAP_UP_GRACE}", str(cm.exception))
+            steers = [json.loads(x)["record"] for x in c.transcript_path.read_text().splitlines()]
+            self.assertTrue(any(r.get("streamingBehavior") == "steer" and r.get("message") == "answer now" for r in steers))
+        self.run_with_client(body)
+
+    def test_minimal_resources_and_explicit_extensions_on_the_command_line(self):
+        captured = {}
+        async def fake_exec(*args, **kw):
+            captured["args"] = args
+            raise RuntimeError("stop after argv")
+        c = PiRPC(cwd=ROOT, session_dir=Path("/tmp/x"), session_id="t", name="t", pi_bin="pi", extensions=False,
+                  extension_paths=[ROOT / "pi_extensions" / "rsi-context.ts"], minimal_resources=True)
+        from unittest import mock
+        with mock.patch("asyncio.create_subprocess_exec", fake_exec):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(c.start())
+        args = list(captured["args"])
+        for flag in ("--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files"):
+            self.assertIn(flag, args)
+        self.assertEqual(args[args.index("--extension") + 1], str(ROOT / "pi_extensions" / "rsi-context.ts"))
+
     def test_large_rpc_line(self):
         async def body(c):
             self.assertEqual(len(await c.prompt_and_wait("BIG_LINE", timeout=10)), 200_000)

@@ -180,11 +180,18 @@ CREATE INDEX IF NOT EXISTS idx_metrics_exp ON metrics(experiment_id);
 '''
 
 
-AGENT_RUN_COLUMNS = {
-    "tool_calls": "INTEGER DEFAULT 0",
-    "experiment_id": "TEXT",
-    "transcript_path": "TEXT",
-    "session_file": "TEXT",
+# Additive column migrations for databases created by older harness versions.
+MIGRATIONS = {
+    # fresh_input_tokens: input not already seen in the previous model call of the same task (what an
+    # ideal prefix cache must still process); turns: model calls in the task.
+    "agent_runs": {"tool_calls": "INTEGER DEFAULT 0", "experiment_id": "TEXT", "transcript_path": "TEXT", "session_file": "TEXT",
+                   "fresh_input_tokens": "INTEGER", "turns": "INTEGER"},
+    # kind: mechanism|combination|revival|tuning (declared by the scout); params: effective knobs passed on the CLI.
+    "experiments": {"kind": "TEXT", "params_json": "TEXT"},
+    # Beliefs carry their evidence so confidence can be capped by evidence grade and duplicates merged.
+    "beliefs": {"support": "INTEGER DEFAULT 1", "contradict": "INTEGER DEFAULT 0", "evidence_ids": "TEXT"},
+    # source='harness' marks effects computed from the actual knob diff; NULL = legacy agent claims.
+    "parameter_effects": {"source": "TEXT"},
 }
 
 
@@ -209,11 +216,11 @@ class ResearchDB:
         c = sqlite3.connect(self.path)
         try:
             c.executescript(SCHEMA)
-            # Additive migration for databases created before transcript/tool accounting existed.
-            have = {r[1] for r in c.execute("PRAGMA table_info(agent_runs)")}
-            for col, decl in AGENT_RUN_COLUMNS.items():
-                if col not in have:
-                    c.execute(f"ALTER TABLE agent_runs ADD COLUMN {col} {decl}")
+            for table, cols in MIGRATIONS.items():
+                have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+                for col, decl in cols.items():
+                    if col not in have:
+                        c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
             c.commit()
         finally:
             c.close()
@@ -275,6 +282,8 @@ class ResearchDB:
             "novelty": exp.get("novelty"),
             "changes_json": json_dumps(exp.get("changes", {})),
             "metadata_json": json_dumps(exp.get("metadata", {})),
+            "kind": exp.get("kind"),
+            "params_json": json_dumps(exp.get("params", {})),
         }
         cols = ",".join(fields)
         qs = ",".join("?" for _ in fields)
@@ -287,9 +296,9 @@ class ResearchDB:
         if not changes:
             return
         changes["updated_at"] = time.time()
-        for key in ["changes", "metadata", "next_steps"]:
+        for key in ["changes", "metadata", "next_steps", "params"]:
             if key in changes:
-                new_key = key + "_json" if key in {"changes", "metadata"} else key
+                new_key = key if key == "next_steps" else key + "_json"
                 changes[new_key] = json_dumps(changes.pop(key))
         # Column names cannot be bound parameters; restrict them to the real schema.
         allowed = {r["name"] for r in self.query("PRAGMA table_info(experiments)")}
@@ -323,6 +332,15 @@ class ResearchDB:
     def completed_count(self) -> int:
         row = self.one("SELECT COUNT(*) AS n FROM experiments WHERE status IN ('completed','promising','champion','near_miss','rejected','failed','invalid')")
         return int(row["n"] if row else 0)
+
+    def metric_stats(self, experiment_id: str, stage: str) -> tuple[float | None, float, int]:
+        """(mean, sample std, n) of all recorded measurements of one experiment at one stage."""
+        vals = [float(r["metric"]) for r in self.query("SELECT metric FROM metrics WHERE experiment_id=? AND stage=?", (experiment_id, stage))]
+        if not vals:
+            return None, 0.0, 0
+        mean = sum(vals) / len(vals)
+        std = (sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)) ** 0.5 if len(vals) > 1 else 0.0
+        return mean, std, len(vals)
 
     def metric_mean(self, experiment_id: str, stage: str) -> float | None:
         row = self.one("SELECT AVG(metric) AS x FROM metrics WHERE experiment_id=? AND stage=?", (experiment_id, stage))

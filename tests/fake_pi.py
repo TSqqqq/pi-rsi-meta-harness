@@ -21,18 +21,17 @@ for raw in sys.stdin.buffer:
     elif t=="get_last_assistant_text": resp(t,{"text":last})
     elif t=="prompt":
         msg=req.get("message","")
-        if msg.startswith("/skill:"):
-            last="READY"
-        elif "Return STRICT JSON only" in msg and "hypotheses" in msg:
-            last=json.dumps({"hypotheses":[{"title":"toy improvement","parent_ids":["baseline"],"hypothesis":"toy hypothesis","mechanism":"toy mechanism","expected_delta":0.2,"confidence":0.8,"novelty":0.7,"changes_hint":{"toy":[0,1]},"cheapest_falsification":"quick","difference_from_history":"new"}]})
-        elif "scientific experiment reviewer" in msg:
-            last=json.dumps({"status":"completed","lesson":"toy lesson","failure_reason":None,"confidence_update":0.8,"next_steps":[],"attribution":"toy","should_revisit":False,"belief_updates":[{"key":"toy","statement":"toy works","confidence":0.8}],"parameter_effects":[{"parameter":"toy","from":"0","to":"1","effect":0.1,"confidence":0.8}]})
-        elif "candidate-selection critic" in msg:
-            last=json.dumps({"selected":[{"index":0,"reason":"toy","priority":1}]})
-        elif "meta-RSI reviewer" in msg:
-            last=json.dumps({"rationale":"toy","policy":{"increase_budget":[],"decrease_budget":[],"revive_nodes":[],"crossovers":[],"new_directions":[],"exploration_ratio":0.3,"model_routing_notes":""}})
+        with open(os.environ.get("FAKE_PI_LOG","/dev/null"),"a") as f: f.write("prompt\n")
+        if "Return STRICT JSON only" in msg and "hypotheses" in msg:
+            last=json.dumps({"hypotheses":[{"kind":"mechanism","title":"toy improvement","parent_ids":["baseline"],"hypothesis":"toy hypothesis","mechanism":"toy mechanism","expected_delta":0.2,"confidence":0.8,"novelty":0.7,"changes_hint":{"toy":[0,1]},"cheapest_falsification":"quick","difference_from_history":"new"}]})
+        elif "Your patch failed when the controller ran it" in msg:
+            last="fixed"
+            if os.environ.get("FAKE_PI_BREAK"):  # second turn: repair the bug from the first
+                with open(os.path.join(os.getcwd(), "train.py"), "w") as f: f.write("print('train fixed')\n")
         elif "implementation worker" in msg:
             last="implemented toy change"
+            if os.environ.get("FAKE_PI_BREAK"):  # first turn: a patch that crashes when run
+                with open(os.path.join(os.getcwd(), "train.py"), "w") as f: f.write("raise SystemExit('boom')\n")
             if os.environ.get("FAKE_PI_ESCAPE"):
                 # Simulates an agent that edits the main checkout instead of its worktree.
                 try:
@@ -56,6 +55,9 @@ for raw in sys.stdin.buffer:
         print(json.dumps({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":last}}),flush=True)
         print(json.dumps({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":last}],"provider":model["provider"],"model":model["id"]}}),flush=True)
         print(json.dumps({"type":"agent_settled"}),flush=True)
+    elif t=="new_session":
+        with open(os.environ.get("FAKE_PI_LOG","/dev/null"),"a") as f: f.write("new_session\n")
+        resp(t,{"cancelled":False})
     elif t=="abort":
         print(json.dumps({"type":"agent_settled"}),flush=True)
         resp(t)

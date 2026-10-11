@@ -104,8 +104,6 @@ class DashboardServer:
             "status_counts": status_counts,
             "guidance": guidance,
             "dependency_requests": deps,
-            "active_policy": self.db.get_meta("active_policy", {}),
-            "plateau_report": self.db.get_meta("plateau_report", {}),
             "human_note": note,
             "idea_queue": ideas,
             "started_at": self.db.get_meta("started_at", None),
